@@ -56,8 +56,13 @@ CONTEXT_SIZE = 4096   # rows sampled from train each epoch as the retrieval bank
 
 
 def tabr_fit_eval(
-    parts, tri, tei, ncat, kind, y, spw=None, trs=None, want_imp=False, split=None
+    parts, tri, tei, ncat, kind, y, spw=None, trs=None, want_imp=False, split=None,
+    is_regression=False, exp_tag=None,
 ):
+    # `is_regression` and `exp_tag` are passed by the harness to every trainer; their
+    # absence here raised TypeError and made TabR fail on every split and seed.
+    if kind in ("reg", "regression"):
+        is_regression = True
     DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = DEV.type == "cuda"
     ya = np.asarray(y, dtype=np.float32)
@@ -86,9 +91,15 @@ def tabr_fit_eval(
                            pin_memory=use_amp, num_workers=0)
 
     eval_size = min(30000, len(X_te_np))
-    eval_idx = rng.choice(len(X_te_np), size=eval_size, replace=False)
-    X_eval_tensor = torch.tensor(X_te_np[eval_idx]).to(DEV)
-    y_eval = ya[tei][eval_idx]
+    # Validation for epoch selection must NOT be the test slice: the loop keeps the
+    # best-scoring epoch, so validating on `tei` selects the model on the data it
+    # is then reported against. `trs` is the harness's held-out slice.
+    _val_X, _val_i = ((X_trs_np, np.asarray(trs)) if X_trs_np is not None
+                      else (X_te_np, np.asarray(tei)))
+    eval_size = min(eval_size, len(_val_X))
+    eval_idx = rng.choice(len(_val_X), size=eval_size, replace=False)
+    X_eval_tensor = torch.tensor(_val_X[eval_idx]).to(DEV)
+    y_eval = ya[_val_i][eval_idx]
 
     best_auc, patience, patience_counter, best_weights = 0.0, 5, 0, None
 

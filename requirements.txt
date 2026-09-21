@@ -19,7 +19,7 @@ xgboost>=2.1.0
 umap-learn>=0.5.6
 lightgbm>=4.4.0
 catboost>=1.2.5
-torch>=2.5.1+cu121
+torch==2.5.1+cu121
 pytorch-tabnet>=4.1.0
 
 # util

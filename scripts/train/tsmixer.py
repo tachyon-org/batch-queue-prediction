@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from eval.helper import _empty_gpu, _get_slice
-from eval.wandb_logger import log_epoch
+from eval.wandb_logger import log_epoch, log_summary
 from eval.paths import model_path
 
 
@@ -109,6 +109,7 @@ def tsmixer_fit_eval(
     split=None,
     is_regression=False,
     exp_tag=None,
+    refit_idx=None,
 ):
     # Auto-detect regression task
     if kind in ["reg", "regression"]:
@@ -137,12 +138,15 @@ def tsmixer_fit_eval(
         flush=True,
     )
 
-    model = TSMixer(
-        num_features=num_features, d_model=32, depth=3, dropout=0.1
-    ).to(DEV)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=1e-3, weight_decay=1e-4
-    )
+    def _build():
+        """Fresh model + optimizer. The refit trains from scratch rather than
+        continuing the selection model: only the epoch count carries over."""
+        m = TSMixer(
+            num_features=num_features, d_model=32, depth=3, dropout=0.1
+        ).to(DEV)
+        return m, torch.optim.AdamW(m.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    model, optimizer = _build()
 
     # --- Loss function & task setup ---
     if is_regression:
@@ -166,13 +170,20 @@ def tsmixer_fit_eval(
     )
 
     eval_size = min(30000, len(X_te_np))
-    eval_idx = np.random.choice(len(X_te_np), size=eval_size, replace=False)
-    X_eval_tensor = torch.from_numpy(X_te_np[eval_idx]).to(
+    # Validation for epoch selection must NOT be the test slice: the loop keeps the
+    # best-scoring epoch, so validating on `tei` selects the model on the data it
+    # is then reported against. `trs` is the harness's held-out slice.
+    _val_X, _val_i = ((X_trs_np, np.asarray(trs)) if X_trs_np is not None
+                      else (X_te_np, np.asarray(tei)))
+    eval_size = min(eval_size, len(_val_X))
+    eval_idx = np.random.choice(len(_val_X), size=eval_size, replace=False)
+    X_eval_tensor = torch.from_numpy(_val_X[eval_idx]).to(
         DEV, non_blocking=True
     )
-    y_eval = ya[tei][eval_idx]
+    y_eval = ya[_val_i][eval_idx]
 
     best_score = -float("inf")
+    best_epoch = 0
     patience, patience_counter, best_weights = 5, 0, None
 
     for epoch in range(10):
@@ -219,6 +230,7 @@ def tsmixer_fit_eval(
 
         if val_score > best_score:
             best_score = val_score
+            best_epoch = epoch + 1
             patience_counter = 0
             best_weights = copy.deepcopy(model.state_dict())
         else:
@@ -228,6 +240,56 @@ def tsmixer_fit_eval(
 
     if best_weights is not None:
         model.load_state_dict(best_weights)
+
+    if refit_idx is not None and best_epoch > 0:
+        # Selection is done and its model is discarded. Retrain from scratch on the
+        # FULL training window for exactly the epoch count the holdout chose, with no
+        # validation and no early stopping, so the final fit sees every row the trees
+        # see. See docs/validation-protocol.md.
+        refit_idx = np.asarray(refit_idx)
+        print(f"    [TSMixer] refit: {{len(refit_idx):,}} rows x {{best_epoch}} epoch(s) "
+              f"(selected on {{len(_val_i):,}} holdout rows, best {{best_score:.5f}})",
+              flush=True)
+        # Rebound rather than deleted: the cleanup at the end of this function still
+        # names them, and `del` here would make that a NameError on the refit path.
+        ds_tr = loader_tr = Xtr_np = None
+        gc.collect()
+
+        X_rf = np.ascontiguousarray(
+            np.asarray(_get_slice(parts, refit_idx), dtype=np.float32))
+        loader_rf = DataLoader(
+            TensorDataset(torch.from_numpy(X_rf), torch.from_numpy(ya[refit_idx])),
+            batch_size=16384, shuffle=True, drop_last=False,
+            pin_memory=use_amp, num_workers=0,
+        )
+        log_summary(selected_epoch=best_epoch,
+                    selection_score=float(best_score),
+                    holdout_rows=int(len(_val_i)),
+                    final_fit_rows=int(len(refit_idx)))
+        model, optimizer = _build()
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        for epoch in range(best_epoch):
+            running_loss = 0.0
+            model.train()
+            for bx, by in loader_rf:
+                bx = bx.to(DEV, non_blocking=True)
+                by = by.to(DEV, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    loss = criterion(model(bx), by)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                running_loss += loss.item()
+            avg = running_loss / len(loader_rf)
+            print(f"    [TSMixer] refit epoch {{epoch+1:02d}}/{{best_epoch}} | "
+                  f"Loss: {{avg:.4f}}", flush=True)
+            log_epoch(epoch + 1, {{"refit/loss": avg}}, phase="tsmixer-e2-refit")
+        del loader_rf, X_rf
+        gc.collect()
+
 
     # Save trained model to disk
     save_path = model_path(exp_tag, "tsmixer", kind, split, ".pt")

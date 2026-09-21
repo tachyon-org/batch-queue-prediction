@@ -28,16 +28,16 @@ fife-batch-jobs/
 │   ├── eval/
 │   │   ├── harness.py              		# Main CLI evaluation harness
 │   │   └── helper.py               		# Model loaders, metrics, and prediction routines
-│   ├── output/                     		# Evaluation metrics and feature importance output JSONs
-|   ├── notebooks/
-|   |    ├── data-explorer.ipynb    		# Job data visualization app example (work in progress)
-|   |    ├── data-analysis.ipynb    		# Initial job data analysis
-|   |    ├── feat-engineering.ipynb 		# Training and testing setup for job prediction tasks
-|   |    ├── pred-analysis.ipynb    		# Job outcome prediction results
-|   |    ├── wait_time_regresssion.ipynb	# Queue wait time prediction results
+│   ├── logs/                       		# Run logs from long-running sweeps (gitignored)
+│   ├── output/                     		# Figures (PDF) and per-run evaluation JSONs
 │   ├── results/                      		# Job prediction results (JSON format)
 │   ├── train/                      		# Model implementations
 │   ├── vis/								# Data explorer visualization
+|   ├── data-explorer.ipynb    				# Job data visualization app example (work in progress)
+|   ├── data-analysis.ipynb    				# Initial job data analysis, distribution fits
+|   ├── feat-engineering.ipynb 				# Training and testing setup for job prediction tasks
+|   ├── pred-analysis.ipynb    				# Job outcome prediction results
+|   ├── wait_time_regression.ipynb			# Queue wait time prediction results
 |   ├── load.py								# Module to load/process the job logs
 |   ├── run_sweep.sh						# Full sweep: all models x both splits x all tasks
 ├── .gitignore                      		# Dataset and runtime configuration
@@ -47,6 +47,13 @@ fife-batch-jobs/
 ├── README.md                       		# Repo info
 └── config.json								# Dataset and runtime configuration
 ```
+
+The notebooks live directly in `scripts/`, beside `eval/` and `train/`, rather than in
+a `notebooks/` subdirectory. Jupyter sets the working directory to the notebook's own
+folder, so this is what lets `from eval.dataset import load_experiment` resolve with no
+`sys.path` manipulation, and it makes the relative paths in the notebooks (`results/`,
+`output/`) the same ones the harness uses. Run them with `scripts/` as the working
+directory.
 
 ### Requirements
 
@@ -184,7 +191,7 @@ WANDB_MODE=offline ./run_sweep.sh                # log locally, sync later
 | `WANDB`         | `1`                                | `0` disables logging entirely.                                                                                                                     |
 | `WANDB_MODE`    | unset                                | `offline` writes to `wandb/` for a later `wandb sync`.                                                                                         |
 
-The sweep must be run **after** the feature pipeline has been regenerated; see the notebook order in `scripts/notebooks/` (`data-analysis.ipynb` -> `feat-engineering.ipynb`)
+The sweep must be run **after** the feature pipeline has been regenerated; see the notebook order in `scripts/` (`data-analysis.ipynb` -> `feat-engineering.ipynb`)
 
 ### Experiment tracking (Weights & Biases)
 
@@ -201,17 +208,6 @@ python3 -m eval.harness e1 xgboost both --wandb
 If you already ran `wandb login` or set `WANDB_API_KEY`, leave `api_key` blank. Blank
 keys fall back to the defaults in `eval/wandb_logger.py`.
 
-Override order: CLI > environment (`WANDB_PROJECT`, `WANDB_ENTITY`, `WANDB_MODE`,
-`WANDB_API_KEY`) > `config/wandb.yaml`. `--no-wandb` overrides everything.
-
-One run per *(experiment, model, split, seed)*, named `e1-xgboost-temporal-s42` and
-grouped as `e1-xgboost` with `job_type=temporal`, so the random-vs-temporal contrast
-reads as one comparison. Logged: per-epoch loss/validation curves for the neural
-models, final metrics (to history and to the run summary), and feature importance.
-Trees have no epochs -- `--wandb-tree-rounds` adds per-round curves but needs an
-`eval_set` and is scored on a training subsample, not validation. TROUT/`hierarchical`
-wraps LightGBM and reports final metrics only.
-
 ### Metrics
 
 ##### Job failure classification/fault attribution
@@ -225,32 +221,15 @@ Precision, recall, F1, ROC-AUC, PR-AUC
 - sMAPE (%): symmetric mean absolute percentage error (bounded between $0\%$ and $200\%$)
 - within-2x ratio: proportion of predictions falling within a factor of 2 of actual wait times
 
-Error is also broken out by **queueing regime**. These bins are not round numbers:
-they are the crossover points of a three-component lognormal mixture fitted to the
-FermiGrid wait distribution (`notebooks/data-analysis.ipynb`, cell `fgmix`), where one
-component overtakes the next at 106 s and 2,857 s.
+Error is also broken out by **queueing regime**. These bins are crossover points of a three-component lognormal mixture fitted to the
+FermiGrid wait distribution (`scripts/data-analysis.ipynb`).
 
-| Key      | Range           | Mechanism                                     |
-| -------- | --------------- | --------------------------------------------- |
-| `inst` | < 2 min         | matched into an already-idle pilot slot       |
-| `turn` | 2 min -- 45 min | waiting for an occupied slot to turn over     |
-| `prov` | 45 min -- 1 day | waiting for new pilot provisioning            |
+| Key      | Range           | Mechanism                                         |
+| -------- | --------------- | ------------------------------------------------- |
+| `inst` | < 2 min         | matched into an already-idle pilot slot           |
+| `turn` | 2 min -- 45 min | waiting for an occupied slot to turn over         |
+| `prov` | 45 min -- 1 day | waiting for new pilot provisioning                |
 | `park` | > 1 day         | beyond the fitted range (not a regime; see below) |
-
-The first three bins are the mixture's component crossovers -- k = 3 gives exactly
-three regions. `park` is not a fourth component: it is everything past the 1 d cap
-applied to the fit's population, reported separately only so that ~2% of jobs with
-~20x larger errors cannot dominate the `prov` statistic.
-
-The older `<10m / 10m-2h / >2h` keys (`mae_10m`, `mae_2h`, `mae_long`) are still
-emitted so entries appended to `results/wait_time_results.json` before this change
-stay comparable; the regime keys are named separately so no existing key silently
-changed meaning.
-
-Two no-feature **reference predictors** are scored on every split and printed before
-the model numbers, because the wait distribution is wide but unimodal in log space and
-a single constant already reaches within-2x ≈ 0.25 -- model numbers are not
-interpretable without that floor.
 
 ### References
 

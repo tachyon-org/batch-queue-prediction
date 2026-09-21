@@ -21,7 +21,11 @@ class Hierarchical:
         num_leaves=63,
         min_child_samples=50,
         smoothing_weight=20,
+        seed=42,
+        subsample=0.8,
     ):
+        self.seed = seed
+        self.subsample = subsample
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.learning_rate = learning_rate
@@ -43,7 +47,13 @@ class Hierarchical:
             learning_rate=self.learning_rate,
             num_leaves=self.num_leaves,
             min_child_samples=self.min_child_samples,
-            random_state=42,
+            # Was a hardcoded 42, so the seed never reached this learner. Row
+            # subsampling (subsample_freq >= 1, or LightGBM ignores it) is what makes
+            # the fit stochastic at all -- without it the seed has nothing to act on
+            # and a multi-seed run reports a spread of exactly 0.
+            random_state=self.seed,
+            subsample=self.subsample,
+            subsample_freq=1,
             n_jobs=-1,
             verbosity=-1,
         )
@@ -115,7 +125,8 @@ def hierarchical_fit_eval(
     trs=None,
     want_imp=False,
     split=None,
-    exp_tag=None
+    exp_tag=None,
+    seed=42,
 ):
     """
     Harness-compliant entry point for Hierarchical wait-time regression.
@@ -146,6 +157,7 @@ def hierarchical_fit_eval(
         max_depth=8,
         learning_rate=0.05,
         smoothing_weight=20,
+        seed=seed,
     )
 
     # Fit Stage 1 & Stage 2

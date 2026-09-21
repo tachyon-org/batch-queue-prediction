@@ -292,31 +292,51 @@ def fit_eval_binary(
     return mm, imp, cm
 
 def fit_eval_reg(
-    lib, parts, tri, tei, trs, yv, want_imp=False, ncat=None, split=None, exp_tag=None
+    lib, parts, tri, tei, trs, yv, want_imp=False, ncat=None, split=None,
+    exp_tag=None, seed=DEFAULT_SEED, refit_idx=None
 ):
-    """Fits the requested regression model library and returns wait time regression metrics and importance."""
+    """Fits the requested regression model library and returns wait time regression metrics and importance.
+
+    `seed` must be threaded through: the neural trainers draw init and shuffling from
+    the global RNGs, and the tree regressors subsample rows and columns, so without it
+    every seed refits the identical model and the spread across seeds is exactly 0.
+
+    `refit_idx` is the FULL training window. Models that select an epoch count on the
+    validation holdout use `tri`/`trs` for that, then refit on `refit_idx`; models with
+    nothing to select (the boosted trees, the hierarchical estimator) skip selection
+    and fit on `refit_idx` directly. Both paths end with every model's final fit seeing
+    the same rows, which is what makes the cross-model comparison mean anything --
+    holding the most recent 10% out of the final fit cost XGBoost 0.13 R2_log on the
+    temporal split despite it having no epoch to select. See docs/validation-protocol.md.
+    """
+    # Models with no selection step fit here; the holdout would only take data away.
+    _fit_i = tri if refit_idx is None else np.asarray(refit_idx)
+    set_global_seed(seed)
     yva = np.asarray(yv)
     nfeat = _nfeat(parts)
     imp = None
 
     if lib == "mlp":
         p_te, p_trs = mlp_fit_eval(
-            parts, tri, tei, ncat, "reg", yv, trs=trs, split=split, exp_tag=exp_tag
+            parts, _fit_i, tei, ncat, "reg", yv, trs=trs, split=split, exp_tag=exp_tag
         )
 
     elif lib == "tabnet":
         p_te, p_trs, imp = tabnet_fit_eval(
-            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split, exp_tag=exp_tag
+            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
+            exp_tag=exp_tag, seed=seed, refit_idx=refit_idx
         )
 
     elif lib == "saint":
         p_te, p_trs, imp = saint_fit_eval(
-            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split, exp_tag=exp_tag, is_regression=True
+            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
+            exp_tag=exp_tag, is_regression=True, refit_idx=refit_idx
         )
 
     elif lib == "ft":
         p_te, p_trs, imp = ft_fit_eval(
-            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split, exp_tag=exp_tag, is_regression=True
+            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
+            exp_tag=exp_tag, is_regression=True, refit_idx=refit_idx
         )
 
     elif lib == "tabr":
@@ -326,18 +346,20 @@ def fit_eval_reg(
 
     elif lib == "tsmixer":
         p_te, p_trs, imp = tsmixer_fit_eval(
-            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split, exp_tag=exp_tag, is_regression=True
+            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
+            exp_tag=exp_tag, is_regression=True, refit_idx=refit_idx
         )
 
     elif lib == "hierarchical":
         p_te, p_trs, imp = hierarchical_fit_eval(
-            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split, exp_tag=exp_tag
+            parts, _fit_i, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
+            exp_tag=exp_tag, seed=seed
         )
 
     elif lib in ("xgboost", "xgb"):
-        Xtr = _get_slice(parts, tri)
-        m = _xgb_reg()
-        m.fit(Xtr, yva[tri])
+        Xtr = _get_slice(parts, _fit_i)
+        m = _xgb_reg(seed)
+        m.fit(Xtr, yva[_fit_i])
 
         X_trs = _xgb_prep(_get_slice(parts, trs))
         X_tei = _xgb_prep(_get_slice(parts, tei))
@@ -360,8 +382,8 @@ def fit_eval_reg(
         del m, Xtr, X_trs, X_tei
 
     else:
-        Xtr = _get_slice(parts, tri)
-        m = _sk_fit(_sk_reg(lib), Xtr, yva[tri])
+        Xtr = _get_slice(parts, _fit_i)
+        m = _sk_fit(_sk_reg(lib, seed), Xtr, yva[_fit_i])
         p_trs = m.predict(_get_slice(parts, trs))
         p_te = m.predict(_get_slice(parts, tei))
         if want_imp:
@@ -514,7 +536,7 @@ def run_e2_reference(wait_log, splits, results=None):
 
 
 def run_e2_dist(lib, Xsub, wait_log, splits, ncat, head="quantile", censored=None,
-                seed=DEFAULT_SEED, results=None):
+                order=None, seed=DEFAULT_SEED, results=None):
     """Executes the distributional wait head across splits, alongside `run_e2_model`."""
     got = {}
     for split, a, b in splits:
@@ -522,9 +544,12 @@ def run_e2_dist(lib, Xsub, wait_log, splits, ncat, head="quantile", censored=Non
                        head=head, n_train=int(len(a)), n_test=int(len(b)))
         try:
             yva = np.asarray(wait_log, dtype=np.float64)
-            tri = a[~np.isnan(yva[a])]
+            tri_all = a[~np.isnan(yva[a])]
             tei = b[~np.isnan(yva[b])]
-            trs = thr_sample(tri)
+            fit_i, val_i = holdout_split(
+                tri_all, order=order if split == "temporal" else None)
+            tri = fit_i
+            trs = thr_sample(val_i)
 
             t0 = time.perf_counter()
             mm, _ = fit_eval_reg_dist(lib, [Xsub], tri, tei, trs, yva, head=head,
@@ -628,8 +653,13 @@ def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None, see
     return got
 
 
-def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, seed=DEFAULT_SEED):
-    """Executes submit-time wait regression across requested splits for a given model architecture."""
+def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None,
+                 seed=DEFAULT_SEED):
+    """Executes submit-time wait regression across requested splits for a given model architecture.
+
+    `order` is the per-row time key used to carve the validation slice off the end of
+    the training window on temporal splits; see `holdout_split`.
+    """
     got = {}
     for split, a, b in splits:
         wb = _wb_start("e2", lib, split, seed, n_train=int(len(a)), n_test=int(len(b)))
@@ -637,9 +667,20 @@ def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, seed=DEFAULT_SEED
             # Mask out unobserved or NaN wait times
             vw_a = ~np.isnan(wait_log[a])
             vw_b = ~np.isnan(wait_log[b])
-            tri = a[vw_a]
+            tri_all = a[vw_a]
             tei = b[vw_b]
-            trs = thr_sample(tri)
+            # Genuine holdout, as E1/E3 already do. `trs` was previously a subsample
+            # of the training rows themselves, so a neural trainer validating on it
+            # was validating on data it had fit -- early stopping could not see
+            # overfitting at all. Fit on fit_i, validate on a slice held out of it.
+            fit_i, val_i = holdout_split(
+                tri_all, order=order if split == "temporal" else None)
+            tri = fit_i
+            trs = thr_sample(val_i)
+            print(f"[{lib}/{split}] fit {len(fit_i):,} | validation holdout "
+                  f"{len(val_i):,} ({len(val_i) / len(tri_all):.0%}"
+                  f"{', most recent' if order is not None and split == 'temporal' else ', random'})",
+                  flush=True)
 
             t_start = time.perf_counter()
             mm, imp, _ = fit_eval_reg(
@@ -652,7 +693,9 @@ def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, seed=DEFAULT_SEED
                 want_imp=True,
                 ncat=ncat,
                 split=split,
-                exp_tag="e2"
+                exp_tag="e2",
+                seed=seed,
+                refit_idx=tri_all,
             )
             if imp is not None:
                 imp_store[(lib, split)] = imp
@@ -1161,7 +1204,7 @@ if __name__ == "__main__":
         _got = {}
         for sd in SEEDS:
             _got.update(run_e2_model(
-                args.model, Xsub, wait_log, SPLITS, IMP, NCAT_SUB, seed=sd
+                args.model, Xsub, wait_log, SPLITS, IMP, NCAT_SUB, order=QS, seed=sd
             ) or {})
         report_seed_variance(_got, ["r2_log", "within2x", "mae_log1p", "median_ae_s"],
                              label=f" [e2/{args.model}]")
@@ -1177,7 +1220,7 @@ if __name__ == "__main__":
         CENS = (~RAN) if (args.head == "aft" and "RAN" in dir() and RAN is not None) else None
         for sd in SEEDS:
             run_e2_dist(args.model, Xsub, wait_log, SPLITS, NCAT_SUB,
-                        head=args.head, censored=CENS, seed=sd)
+                        head=args.head, censored=CENS, order=QS, seed=sd)
 
     elif args.experiment == "e3":
         if ftype is not None:

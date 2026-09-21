@@ -1799,12 +1799,20 @@ def load_saved_importances(
     X_eval=None,
     y_eval=None,
     exp_tag="bin_e1",
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=None,
 ):
     """Scans directories, loads saved Tree, TabNet, and PyTorch DL models, and returns.
 
     an imp_dict keyed by (model, split) with normalized importances.
+
+    `device=None` resolves to CUDA-if-present at CALL time. It must not be a default
+    argument expression: Python evaluates those at import, so a `torch.cuda` probe
+    there ran every time this module was imported or reloaded -- including from
+    analysis notebooks that never touch a model -- and blocked outright whenever the
+    driver was wedged. The other loaders here already take `device=None`.
     """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     aliases = {
         "xgboost": ["xgboost", "xgb"],
         "lightgbm": ["lightgbm", "lgb"],
