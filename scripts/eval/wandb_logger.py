@@ -35,13 +35,6 @@ _ACTIVE = None
 _WARNED = set()
 
 
-# Bumped whenever a change makes runs non-comparable with earlier ones. It lands in
-# both the run config and the tags, so the W&B UI can filter old protocols out: runs
-# before this carry test-set epoch selection (leaky) or a holdout that was never
-# refit, and their numbers do not belong on a chart with these.
-PROTOCOL = "select-then-refit"
-
-
 def _warn_once(key, msg):
     if key not in _WARNED:
         _WARNED.add(key)
@@ -111,7 +104,7 @@ class WandbRun:
         if cfg.get("api_key"):
             os.environ.setdefault("WANDB_API_KEY", str(cfg["api_key"]))
         run_cfg = {"experiment": experiment, "model": model, "split": split,
-                   "seed": seed, "protocol": PROTOCOL, **(extra or {})}
+                   "seed": seed, **(extra or {})}
         try:
             run = wandb.init(
                 project=cfg["project"], entity=cfg.get("entity"),
@@ -122,8 +115,7 @@ class WandbRun:
                 group=f"{experiment}-{model}",
                 job_type=str(split),
                 tags=[str(t) for t in cfg["tags"]]
-                     + [str(experiment), str(model), str(split), f"seed{seed}",
-                        PROTOCOL],
+                     + [str(experiment), str(model), str(split), f"seed{seed}"],
                 notes=cfg.get("notes"), config=run_cfg, reinit=True,
             )
         except Exception as e:

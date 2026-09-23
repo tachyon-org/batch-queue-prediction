@@ -1,14 +1,20 @@
 """Filesystem layout for datasets, saved models and saved predictions.
 
-Every path in the project resolves through here. Each root takes an environment
-override so a run can be pointed elsewhere without editing code:
+Every path in the project resolves through here, in the project's usual order:
 
-    FIFE_DATA_ROOT   feature matrices and targets
-    FIFE_MODEL_ROOT  saved models
-    FIFE_PRED_ROOT   saved test predictions
+    1. environment    FIFE_DATA_ROOT, FIFE_MODEL_ROOT, FIFE_PRED_ROOT
+    2. config file    scripts/config/paths.yaml, `hosts:` section for this host
+    3. config file    scripts/config/paths.yaml, top level
+    4. default        ./data, ./models, ./predictions, relative to scripts/
 
-Everything lives on the fast local NVMe: training mmaps tens of GB out of it
-repeatedly, and /media/storage0 is NFS.
+The `hosts:` section exists because a checkout on a shared filesystem is visible
+from several machines while their fast local storage is not, so one top-level value
+cannot serve them all. Host names appear only in that file, never here.
+
+Nothing here names a particular machine. Training mmaps tens of GB out of these
+roots repeatedly, so on a cluster they should point at fast local storage rather
+than a network mount -- which is what the config file is for. The defaults are
+repo-relative so a fresh checkout runs without configuration.
 
 Model layout is one directory per experiment and model:
 
@@ -23,13 +29,70 @@ one model per seed would multiply the on-disk footprint for artifacts nothing re
 """
 
 import os
+import socket
 
-DATA_ROOT = os.environ.get("FIFE_DATA_ROOT", "/mnt/scratch/fast0/amaustin/datasets/fife")
-MODEL_ROOT = os.environ.get("FIFE_MODEL_ROOT", "/mnt/scratch/fast0/amaustin/models")
-PRED_ROOT = os.environ.get("FIFE_PRED_ROOT", "/mnt/scratch/fast0/amaustin/predictions")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SCRIPTS = os.path.dirname(_HERE)
+CONFIG_PATH = os.environ.get("FIFE_PATHS_CONFIG",
+                             os.path.join(_SCRIPTS, "config", "paths.yaml"))
+
+_DEFAULTS = {
+    "data_root": os.path.join(_SCRIPTS, "data"),
+    "model_root": os.path.join(_SCRIPTS, "models"),
+    "pred_root": os.path.join(_SCRIPTS, "predictions"),
+}
+
+
+HOSTNAME = socket.gethostname().split(".")[0]
+
+
+def _load_config():
+    """Read scripts/config/paths.yaml if present, returning (top_level, this_host).
+
+    Absent or unreadable is not an error -- the defaults stand and the roots can
+    still be set from the environment.
+    """
+    if not os.path.isfile(CONFIG_PATH):
+        return {}, {}
+    try:
+        import yaml
+        with open(CONFIG_PATH) as f:
+            cfg = yaml.safe_load(f) or {}
+        def _strs(d):
+            return {k: v for k, v in (d or {}).items()
+                    if isinstance(v, str) and v.strip()}
+        global _CFG_RAW, _HOST_RAW
+        _CFG_RAW = cfg
+        _HOST_RAW = (cfg.get("hosts") or {}).get(HOSTNAME) or {}
+        return _strs(cfg), _strs(_HOST_RAW)
+    except Exception as e:                      # noqa: BLE001 - config must not break a run
+        print(f"[paths] ignoring {CONFIG_PATH}: {e}")
+        return {}, {}
+
+
+_CFG_RAW, _HOST_RAW = {}, {}
+_CFG, _HOST_CFG = _load_config()
+
+
+def _resolve(env_var, key):
+    return os.path.expanduser(
+        os.environ.get(env_var) or _HOST_CFG.get(key) or _CFG.get(key)
+        or _DEFAULTS[key])
+
+
+# Results are tracked in git, unlike the data and model roots, so they live in the
+# repository at a fixed location. Deliberately not configurable and not relative to
+# the working directory: a run started from anywhere must update the same file.
+RESULTS_DIR = os.path.join(_SCRIPTS, "results")
+
+DATA_ROOT = _resolve("FIFE_DATA_ROOT", "data_root")
+
+MODEL_ROOT = _resolve("FIFE_MODEL_ROOT", "model_root")
+PRED_ROOT = _resolve("FIFE_PRED_ROOT", "pred_root")
 
 # exp_tag values used by the harness -> the directory they belong in.
-_EXP_ALIASES = {"e3_fault": "e3", "e2_dist": "e2dist"}
+_EXP_ALIASES = {"e3_fault": "e3"}
+
 
 def experiment_dir_name(exp_tag):
     if not exp_tag:
@@ -71,3 +134,29 @@ def all_model_dirs():
 
 def data_path(name):
     return os.path.join(DATA_ROOT, name)
+
+
+def describe():
+    """Where each root came from, for a run log or a bug report."""
+    src = {}
+    for env_var, key, val in (("FIFE_DATA_ROOT", "data_root", DATA_ROOT),
+                              ("FIFE_MODEL_ROOT", "model_root", MODEL_ROOT),
+                              ("FIFE_PRED_ROOT", "pred_root", PRED_ROOT)):
+        if os.environ.get(env_var):
+            where = f"env {env_var}"
+        elif _HOST_CFG.get(key):
+            where = f"config hosts.{HOSTNAME}"
+        elif _CFG.get(key):
+            where = "config (top level)"
+        else:
+            where = "default"
+        src[key] = (val, where)
+    return src
+
+
+if __name__ == "__main__":
+    print(f"host {HOSTNAME}   config {CONFIG_PATH}"
+          f"{'' if os.path.isfile(CONFIG_PATH) else '  (absent)'}")
+    for k, (v, where) in describe().items():
+        exists = "" if os.path.isdir(v) else "   [missing]"
+        print(f"  {k:12s} {v}{exists}    [{where}]")

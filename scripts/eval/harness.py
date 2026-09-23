@@ -6,7 +6,6 @@ import datetime as dt
 import traceback
 import numpy as np
 import psutil
-import torch
 import argparse
 import joblib
 from sklearn.metrics import confusion_matrix
@@ -15,14 +14,16 @@ from eval.helper import (
     cls_metrics, cls_metrics_per_class, reg_metrics, THR_GRID, holdout_split,
     set_global_seed, save_predictions, load_predictions, align_predictions,
     cascade_metrics, DEFAULT_SEED, fit_calibrator, calibration_report,
-    terminal_time, temporal_masks, pinball_loss, interval_metrics,
+    terminal_time, temporal_masks,
     wait_reference_metrics, skill_score, WAIT_MIX, WAIT_REGIMES,
     aggregate_seeds,
 )
-from eval.paths import DATA_ROOT, model_path
+from eval.paths import DATA_ROOT, RESULTS_DIR, model_path
+from eval.splits import build_splits
 from eval.wandb_logger import WandbRun, load_config, config_summary
 from train.tree import (_xgb_reg, _sk_reg, _xgb_cls, _xgb_prep, sk_gain, _sk_cls,
-                        _sk_fit, _xgb_quantile, _lgbm_quantile, _xgb_aft, WAIT_TAUS)
+                        _sk_predict, _cat_idx, CAT_MAX_LEVELS,
+                        _sk_fit)
 from train.mlp import mlp_fit_eval
 from train.tabnet import tabnet_fit_eval
 from train.saint import saint_fit_eval
@@ -101,12 +102,9 @@ def _wb_start(experiment, model, split, seed, **extra):
                           seed=seed, extra=extra)
 
 
-def mem_gb():
-    return psutil.Process().memory_info().rss / (1024 ** 3)
-
 def save_experiment_results(exp_name, lib, got_metrics, output_dir=None):
     """Loads existing experiment JSON, updates the entries for the model, and saves back to disk."""
-    output_dir = output_dir if output_dir is not None else os.getcwd() + "/results"
+    output_dir = output_dir if output_dir is not None else RESULTS_DIR
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, f"{exp_name}_results.json")
 
@@ -131,7 +129,7 @@ def save_experiment_results(exp_name, lib, got_metrics, output_dir=None):
 def fit_eval_binary(
     lib, parts, tri, tei, trs, yv, spw, want_imp=False, ncat=None, split=None, exp_tag=None,
     class_names=None, eval_mask=None, seed=DEFAULT_SEED, save_preds=True,
-    calibrate="isotonic",
+    calibrate="isotonic", thr_external=None,
 ):
     """Fits the requested binary model library and returns metrics, importance, and CM.
 
@@ -143,6 +141,12 @@ def fit_eval_binary(
     on. Predictions are still produced, and saved, for all of `tei`. E3 uses this to
     score every test job -- which the cascade needs -- while reporting its own
     conditional metrics on the failed subset only.
+
+    `thr_external` carries an operating point selected under a DIFFERENT protocol,
+    as {'thr': float, 'thr_neg': float|None, 'source': str}. When given, the model
+    is scored a second time at that cut and the result is stored under mm['transfer'].
+    The protocol's own operating point is always computed and stays primary; the
+    transfer is an additional reported point, never a replacement.
     """
     set_global_seed(seed)
     yva = np.asarray(yv)
@@ -286,6 +290,29 @@ def fit_eval_binary(
             mm["threshold_neg_calibrated"] = float(np.asarray(_cal(np.array([thr_neg])))[0])
             mm[class_names[0]]["threshold_calibrated"] = mm["threshold_calibrated"]
             mm[class_names[1]]["threshold_calibrated"] = mm["threshold_neg_calibrated"]
+    if thr_external is not None:
+        # Deployment simulation: an operating point fixed under one protocol and
+        # carried into another without re-calibration. Scored on the same raw scores
+        # as the native point so the two are directly comparable.
+        t_ext = float(thr_external["thr"])
+        if class_names is not None:
+            tn_ext = thr_external.get("thr_neg")
+            tn_ext = float(tn_ext) if tn_ext is not None else None
+            tm = cls_metrics_per_class(
+                y_eval, p_eval, t_ext, thr_neg=tn_ext,
+                pos_name=class_names[0], neg_name=class_names[1],
+            )
+        else:
+            tm = cls_metrics(y_eval, p_eval, t_ext)
+        tm["threshold_source"] = str(thr_external.get("source", "external"))
+        tm["threshold_native"] = float(thr)
+        mm["transfer"] = tm
+        _f1n, _f1t = mm.get("f1"), tm.get("f1")
+        if _f1n is not None and _f1t is not None:
+            print(f"    [{lib}] threshold transfer from {tm['threshold_source']}: "
+                  f"tau {thr:.4f} -> {t_ext:.4f} | F1 {_f1n:.4f} -> {_f1t:.4f} "
+                  f"({_f1t - _f1n:+.4f})", flush=True)
+
     cm = confusion_matrix(
         y_eval.astype(np.int8), (p_eval >= thr).astype(np.int8), labels=[0, 1]
     )
@@ -293,9 +320,20 @@ def fit_eval_binary(
 
 def fit_eval_reg(
     lib, parts, tri, tei, trs, yv, want_imp=False, ncat=None, split=None,
-    exp_tag=None, seed=DEFAULT_SEED, refit_idx=None
+    exp_tag=None, seed=DEFAULT_SEED, refit_idx=None,
+    oot=None, cat_idx=None,
 ):
     """Fits the requested regression model library and returns wait time regression metrics and importance.
+
+    `oot` is the shared out-of-time slice. It is appended to `tei` so every library
+    predicts it in the same pass it already makes, then split back out: `mm` is the
+    protocol test set and `mm["oot"]` the out-of-time one. Neither arm trained on it
+    and nothing is selected on it, so it is a second test set, not a validation set.
+
+    `cat_idx` names the code columns to treat as categorical. It is decided once, by
+    the caller, from pre-cutoff rows, and the SAME list is handed to both arms: the
+    protocols must differ only in how rows are assigned, not in how features are typed.
+    Left None, each fitter falls back to counting levels in its own training data.
 
     `seed` must be threaded through: the neural trainers draw init and shuffling from
     the global RNGs, and the tree regressors subsample rows and columns, so without it
@@ -303,12 +341,18 @@ def fit_eval_reg(
 
     `refit_idx` is the FULL training window. Models that select an epoch count on the
     validation holdout use `tri`/`trs` for that, then refit on `refit_idx`; models with
-    nothing to select (the boosted trees, the hierarchical estimator) skip selection
+    nothing to select (the boosted trees) skip selection
     and fit on `refit_idx` directly. Both paths end with every model's final fit seeing
     the same rows, which is what makes the cross-model comparison mean anything --
     holding the most recent 10% out of the final fit cost XGBoost 0.13 R2_log on the
     temporal split despite it having no epoch to select. See docs/validation-protocol.md.
     """
+    tei = np.asarray(tei)
+    _oot = np.asarray(oot) if oot is not None and len(oot) else None
+    _n_te = len(tei)
+    if _oot is not None:
+        tei = np.concatenate([tei, _oot])
+
     # Models with no selection step fit here; the holdout would only take data away.
     _fit_i = tri if refit_idx is None else np.asarray(refit_idx)
     set_global_seed(seed)
@@ -352,13 +396,15 @@ def fit_eval_reg(
 
     elif lib == "hierarchical":
         p_te, p_trs, imp = hierarchical_fit_eval(
-            parts, _fit_i, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
-            exp_tag=exp_tag, seed=seed
+            parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
+            exp_tag=exp_tag, seed=seed, refit_idx=refit_idx
         )
 
     elif lib in ("xgboost", "xgb"):
         Xtr = _get_slice(parts, _fit_i)
-        m = _xgb_reg(seed)
+        # ncat/nfeat let XGBoost treat the leading code columns as categorical
+        # (partition splits) instead of splitting them as ordered numbers.
+        m = _xgb_reg(seed, ncat=ncat, nfeat=nfeat, cat_idx=cat_idx)
         m.fit(Xtr, yva[_fit_i])
 
         X_trs = _xgb_prep(_get_slice(parts, trs))
@@ -383,9 +429,10 @@ def fit_eval_reg(
 
     else:
         Xtr = _get_slice(parts, _fit_i)
-        m = _sk_fit(_sk_reg(lib, seed), Xtr, yva[_fit_i])
-        p_trs = m.predict(_get_slice(parts, trs))
-        p_te = m.predict(_get_slice(parts, tei))
+        m = _sk_fit(_sk_reg(lib, seed, ncat=ncat, cat_idx=cat_idx), Xtr,
+                    yva[_fit_i], ncat=ncat, cat_idx=cat_idx)
+        p_trs = _sk_predict(m, _get_slice(parts, trs), ncat=ncat, cat_idx=cat_idx)
+        p_te = _sk_predict(m, _get_slice(parts, tei), ncat=ncat, cat_idx=cat_idx)
         if want_imp:
             imp = sk_gain(m, nfeat)
 
@@ -404,180 +451,21 @@ def fit_eval_reg(
     _empty_gpu()
     gc.collect()
 
-    mm = reg_metrics(yva[tei], p_te)
+    p_te = np.asarray(p_te)
+    mm = reg_metrics(yva[tei[:_n_te]], p_te[:_n_te])
+    if _oot is not None:
+        mm["oot"] = reg_metrics(yva[_oot], p_te[_n_te:])
     return mm, imp, p_te
 
 
-def fit_eval_reg_dist(lib, parts, tri, tei, trs, yv, taus=WAIT_TAUS, head="quantile",
-                      censored=None, aft_scale=1.17, seed=DEFAULT_SEED, split=None,
-                      exp_tag="e2"):
-    """Fits a DISTRIBUTIONAL wait-time head and scores it as an interval predictor.
+def _random_first(splits):
+    """Random split before temporal, so its operating point exists to transfer.
 
-    `fit_eval_reg` trains squared error on log1p and emits one number per job. The
-    FermiGrid mixture fit says that is the wrong output object: even a model that
-    knew a job's component exactly would still face a conditional SD of ~1.17 in
-    log space, so the honest deliverable is a range, not a point.
-
-    Two heads:
-      "quantile" -- fits `taus` directly (one multi-output XGBoost model, or one
-        LightGBM model per tau). Trains and predicts in log1p space like the rest
-        of E2, so the outputs drop straight into `reg_metrics`.
-      "aft" -- accelerated failure time with a normal loss, i.e. a conditional
-        lognormal. Predicts a scale in SECONDS; quantiles are recovered as
-        pred * exp(aft_scale * z_tau), which assumes the homoscedastic sigma the
-        objective was fitted with. `aft_scale` defaults to the within-component
-        SD of the fitted mixture. This head is the one that can consume censored
-        rows -- pass `censored`, a boolean row-aligned mask marking jobs whose
-        wait is a lower bound (queued but never ran).
-
-    Returns (metrics, preds_by_tau). `metrics` carries the point metrics of the
-    median head plus pinball loss and interval coverage/width.
+    E1/E3 report a second operating point taken from the random protocol and applied
+    unchanged to the temporal test period (see `fit_eval_binary`). That needs the
+    random run to have happened first; any other split keeps its original position.
     """
-    yva = np.asarray(yv, dtype=np.float64)
-    taus = tuple(float(t) for t in taus)
-    set_global_seed(seed)
-    Xtr = _get_slice(parts, tri)
-    preds = {}
-
-    if head == "aft":
-        # AFT labels live in original time units; the objective takes the log.
-        lo = np.maximum(np.expm1(yva[tri]), 1e-3)
-        hi = lo.copy()
-        if censored is not None:
-            c = np.asarray(censored, dtype=bool)[tri]
-            hi[c] = np.inf
-            print(f"[{lib}/aft] {int(c.sum()):,} of {len(c):,} training rows right-censored",
-                  flush=True)
-        bst = _xgb_aft(Xtr, lo, hi, seed=seed, scale=aft_scale)
-        import xgboost as _xgb
-        from scipy.stats import norm as _norm
-
-        # aft_loss_distribution_scale is a fixed hyperparameter of the LOSS -- XGBoost
-        # never estimates it -- so it is the wrong number to build quantiles from.
-        # Using it directly gave intervals a quarter of the width the quantile heads
-        # produced, and 0.58 coverage against a nominal 0.80. The spread is instead
-        # estimated from the training residuals in log space, on the UNCENSORED rows
-        # only: a censored row's residual is a lower bound, so including it would drag
-        # the estimate down and re-narrow the intervals.
-        fit_pred = bst.predict(_xgb.DMatrix(_xgb_prep(Xtr)))
-        obs = np.isfinite(hi)
-        resid = np.log(np.maximum(lo[obs], 1e-3)) - np.log(np.maximum(fit_pred[obs], 1e-3))
-        sigma = float(np.std(resid))
-        print(f"[{lib}/aft] residual sigma_log = {sigma:.3f} "
-              f"(loss scale was {aft_scale:.2f}; quantiles use the residual)", flush=True)
-
-        scale_pred = bst.predict(_xgb.DMatrix(_xgb_prep(_get_slice(parts, tei))))
-        for t in taus:
-            preds[t] = np.log1p(np.maximum(scale_pred * np.exp(sigma * _norm.ppf(t)), 0.0))
-        del bst
-
-    elif lib in ("xgboost", "xgb"):
-        m = _xgb_quantile(taus, seed=seed)
-        m.fit(Xtr, yva[tri])
-        q = np.asarray(m.predict(_xgb_prep(_get_slice(parts, tei))), dtype=np.float64)
-        q = q.reshape(len(q), -1)
-        for i, t in enumerate(taus):
-            preds[t] = q[:, i]
-        del m
-
-    else:
-        Xte = _get_slice(parts, tei)
-        for t in taus:
-            m = _sk_fit(_lgbm_quantile(t, seed=seed), Xtr, yva[tri])
-            preds[t] = np.asarray(m.predict(Xte), dtype=np.float64)
-            del m
-        del Xte
-
-    del Xtr
-    _empty_gpu()
-    gc.collect()
-
-    # Quantile heads can cross; sorting each row restores monotonicity without
-    # changing any individual head's marginal calibration much.
-    order_t = sorted(preds)
-    stack = np.sort(np.column_stack([preds[t] for t in order_t]), axis=1)
-    preds = {t: stack[:, i] for i, t in enumerate(order_t)}
-
-    med = preds[min(taus, key=lambda t: abs(t - 0.5))]
-    mm = reg_metrics(yva[tei], med)
-    mm.update(pinball_loss(yva[tei], preds))
-    lo_t, hi_t = min(taus), max(taus)
-    iv = interval_metrics(yva[tei], preds[lo_t], preds[hi_t])
-    mm.update({f"iv_{k}": v for k, v in iv.items()})
-    mm["iv_taus"] = [lo_t, hi_t]
-    mm["head"] = head
-    return mm, preds
-
-
-def run_e2_reference(wait_log, splits, results=None):
-    """Scores the two no-feature reference predictors on every split.
-
-    These are the floor E2 has to clear, and without them an R2_log of 0.27 has no
-    scale: a single constant already reaches within-2x ~ 0.25 on this distribution
-    because log wait is wide but unimodal. Fitted on the training slice only, so
-    they are admissible baselines and not oracles.
-    """
-    yva = np.asarray(wait_log, dtype=np.float64)
-    out = {}
-    for split, a, b in splits:
-        tri = a[~np.isnan(yva[a])]
-        tei = b[~np.isnan(yva[b])]
-        ref = wait_reference_metrics(yva[tri], yva[tei])
-        out[split] = ref
-        for name, d in ref.items():
-            log_result("E2", model=f"ref:{name}", split=split,
-                       **{k: v for k, v in d.items() if k != "pred_s"})
-            print(f"{'ref:' + name:14s} {split:9s} pred={d['pred_s']:8,.0f}s  "
-                  f"R2(log) {d['r2_log']:+.3f}  within-2x {d['within2x']:.3f}  "
-                  f"MAE(log1p) {d['mae_log1p']:.3f}", flush=True)
-    if results is not None:
-        results.setdefault("reference", {}).update(out)
-    return out
-
-
-def run_e2_dist(lib, Xsub, wait_log, splits, ncat, head="quantile", censored=None,
-                order=None, seed=DEFAULT_SEED, results=None):
-    """Executes the distributional wait head across splits, alongside `run_e2_model`."""
-    got = {}
-    for split, a, b in splits:
-        wb = _wb_start("e2dist", f"{lib}:{head}", split, seed,
-                       head=head, n_train=int(len(a)), n_test=int(len(b)))
-        try:
-            yva = np.asarray(wait_log, dtype=np.float64)
-            tri_all = a[~np.isnan(yva[a])]
-            tei = b[~np.isnan(yva[b])]
-            fit_i, val_i = holdout_split(
-                tri_all, order=order if split == "temporal" else None)
-            tri = fit_i
-            trs = thr_sample(val_i)
-
-            t0 = time.perf_counter()
-            mm, _ = fit_eval_reg_dist(lib, [Xsub], tri, tei, trs, yva, head=head,
-                                      censored=censored, seed=seed, split=split,
-                                      exp_tag="e2dist")
-            got[split] = mm
-            wb.log_final(mm)
-            log_result("E2dist", model=f"{lib}:{head}", split=split,
-                       **{k: v for k, v in mm.items()
-                          if isinstance(v, (int, float)) and not isinstance(v, bool)})
-            print(
-                f"{'model':14s} {'split':9s}  R2(log)  Within-2x  Pinball  Cover  Width(x)\n"
-                f"{lib + ':' + head:14s} {split:9s}  {mm['r2_log']:.3f}    "
-                f"{mm['within2x']:.3f}      {mm['pinball_mean']:.3f}    "
-                f"{mm['iv_coverage']:.3f}  {mm['iv_width_factor']:.0f}",
-                flush=True,
-            )
-            print(f"Total time: {time.perf_counter() - t0:.2f} seconds")
-        except Exception as e:
-            traceback.print_exc()
-            print(f"  [skip] {lib}/{head}/{split}: {e}", flush=True)
-            _empty_gpu()
-            gc.collect()
-        finally:
-            wb.finish()
-    if results is not None:
-        results.setdefault(f"{lib}:{head}", {}).update(got)
-    return got
+    return sorted(splits, key=lambda s: {"random": 0, "temporal": 1}.get(s[0], 2))
 
 
 def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None, seed=DEFAULT_SEED):
@@ -588,7 +476,8 @@ def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None, see
     """
     yva = np.asarray(yv)
     got = {}
-    for split, a, b in splits:
+    thr_random = None
+    for split, a, b in _random_first(splits):
         wb = _wb_start("e1", lib, split, seed, n_train=int(len(a)), n_test=int(len(b)))
         try:
             fit_i, val_i = holdout_split(a, order=order if split == "temporal" else None)
@@ -614,7 +503,10 @@ def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None, see
                 split=split,
                 exp_tag="e1",
                 seed=seed,
+                thr_external=(thr_random if split == "temporal" else None),
             )
+            if split == "random":
+                thr_random = {"thr": mm["threshold"], "source": "random-split holdout"}
             if imp is not None:
                 imp_store[(lib, split)] = imp
 
@@ -654,13 +546,19 @@ def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None, see
 
 
 def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None,
-                 seed=DEFAULT_SEED):
+                 seed=DEFAULT_SEED, oot=None, cat_idx=None):
     """Executes submit-time wait regression across requested splits for a given model architecture.
 
     `order` is the per-row time key used to carve the validation slice off the end of
     the training window on temporal splits; see `holdout_split`.
     """
     got = {}
+    # The out-of-time slice needs the same valid-wait filter as every other index set;
+    # a NaN label would otherwise reach reg_metrics.
+    oot_v = None
+    if oot is not None and len(oot):
+        oot = np.asarray(oot)
+        oot_v = oot[~np.isnan(wait_log[oot])]
     for split, a, b in splits:
         wb = _wb_start("e2", lib, split, seed, n_train=int(len(a)), n_test=int(len(b)))
         try:
@@ -692,10 +590,12 @@ def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None,
                 wait_log,
                 want_imp=True,
                 ncat=ncat,
+                cat_idx=cat_idx,
                 split=split,
                 exp_tag="e2",
                 seed=seed,
                 refit_idx=tri_all,
+                oot=oot_v,
             )
             if imp is not None:
                 imp_store[(lib, split)] = imp
@@ -713,6 +613,10 @@ def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None,
                 f"{mm['mae_park']:8.0f}s",
                 flush=True,
             )
+            if isinstance(mm.get("oot"), dict):
+                _o = mm["oot"]
+                print(f"{lib:9s} {split + '/oot':9s}  {_o['r2_log']:.3f}    "
+                      f"{_o['median_ae_s']:7.0f}s  {_o['within2x']:.3f}", flush=True)
             t_end = time.perf_counter()
             print(f"Total time: {t_end - t_start:.2f} seconds")
         except Exception as e:
@@ -789,18 +693,12 @@ def run_e3_model(lib, Xm, failed, hw, splits, imp_store, cm_store, ncat, order=N
     hw_a = np.asarray(hw)
     failed_a = np.asarray(failed)
     got = {}
+    thr_random = None
 
     total_failed = (failed_a == 1).sum()
     total_hw = ((failed_a == 1) & (hw_a == 1)).sum()
-    total_payload = ((failed_a == 1) & (hw_a == 0)).sum()
-    
-    print("\n" + "=" * 60, flush=True)
-    print(f"  Total Failed Jobs: {total_failed:,}", flush=True)
-    print(f"  Hardware Faults  : {total_hw:,} ({total_hw / total_failed * 100:.2f}%)", flush=True)
-    print(f"  Payload Faults   : {total_payload:,} ({total_payload / total_failed * 100:.2f}%)", flush=True)
-    print("=" * 60 + "\n", flush=True)
 
-    for split, a, b in splits:
+    for split, a, b in _random_first(splits):
         wb = _wb_start("e3", lib, split, seed, n_train=int(len(a)), n_test=int(len(b)),
                        n_failed=int(total_failed), n_hw=int(total_hw))
         try:
@@ -843,7 +741,15 @@ def run_e3_model(lib, Xm, failed, hw, splits, imp_store, cm_store, ncat, order=N
                 class_names=("hardware", "payload"),
                 eval_mask=eval_mask,
                 seed=seed,
+                thr_external=(thr_random if split == "temporal" else None),
             )
+            if split == "random":
+                # Both cuts travel: E3 tunes hardware and payload separately.
+                thr_random = {
+                    "thr": mm["threshold"],
+                    "thr_neg": mm["payload"]["threshold"],
+                    "source": "random-split holdout",
+                }
             if imp is not None:
                 imp_store[(lib, split)] = imp
 
@@ -951,9 +857,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "experiment",
         type=str,
-        choices=["e1", "e2", "e2dist", "e3", "cascade"],
+        choices=["e1", "e2", "e3", "cascade"],
         help="Experiment: 'e1' (failure classification), 'e2' (wait-time regression), "
-             "'e2dist' (wait-time interval prediction: quantile or AFT head), "
              "'e3' (fault attribution given failure), or 'cascade' (match-time "
              "hardware detection composing saved e1 and e3 scores)",
     )
@@ -1008,15 +913,6 @@ if __name__ == "__main__":
              "the full matrix) and is scored on a training subsample, not validation.",
     )
     parser.add_argument(
-        "--head",
-        type=str,
-        default="quantile",
-        choices=["quantile", "aft"],
-        help="e2dist only: 'quantile' fits the tau grid directly in log1p space; "
-             "'aft' fits a conditional lognormal (survival:aft, normal loss) that "
-             "can also consume right-censored never-ran jobs.",
-    )
-    parser.add_argument(
         "--seeds",
         type=str,
         default=None,
@@ -1045,7 +941,6 @@ if __name__ == "__main__":
     CUTOFF_EPOCH = _parse_cutoff(args.cutoff)
     CUTOFF_LABEL = dt.datetime.fromtimestamp(
         CUTOFF_EPOCH, dt.timezone.utc).strftime("%Y-%m-%d")
-    print(f"temporal cutoff: {CUTOFF_LABEL} ({CUTOFF_EPOCH})", flush=True)
     # 2025-01-01: timestamps below this are unset sentinels, not real dates.
     WINDOW_FLOOR = 1735689600
     targets = np.load(os.path.join(SAVE_DIR, "targets_and_masks.npz"))
@@ -1071,15 +966,19 @@ if __name__ == "__main__":
     if RAN is None:
         print("[warn] ran.npy not found -- every row is treated as a valid target. "
               "Re-run the feature pipeline to regenerate it.", flush=True)
-    wait_sv = np.load(os.path.join(SAVE_DIR, "wait_sv.npy"), mmap_mode="r")
+    # targets_and_masks.npz is what the feature pipeline writes now; the standalone
+    # wait_sv.npy is a leftover it no longer updates, so reading that first would
+    # silently pair fresh features with a stale target.
+    if "wait_sv" in targets.files:
+        wait_sv = targets["wait_sv"]
+    else:
+        wait_sv = np.load(os.path.join(SAVE_DIR, "wait_sv.npy"), mmap_mode="r")
+        print("[warn] wait_sv missing from targets_and_masks.npz; "
+              "falling back to wait_sv.npy", flush=True)
 
     # Compute log-transformed target for wait time regression
     wait_log = np.log1p(np.maximum(wait_sv, 0))
 
-    # Categorical-column counts come from the feature pipeline's schema_meta.json.
-    # This previously read globals(), which is empty in a fresh process -- so ncat was
-    # always None and the neural trainers treated every column as numeric, losing the
-    # entity embeddings. The globals() lookup is kept as a fallback for notebook use.
     _meta_path = os.path.join(SAVE_DIR, "schema_meta.json")
     _SCHEMA = {}
     if os.path.exists(_meta_path):
@@ -1109,7 +1008,7 @@ if __name__ == "__main__":
     #
     # Wait time is known at execution start, failure and fault attribution only at
     # termination, so E2 gets an earlier observation time than E1/E3.
-    _label_src = targets["jst"] if args.experiment in ("e2", "e2dist") else targets["comp"]
+    _label_src = targets["jst"] if args.experiment == "e2" else targets["comp"]
     tau, tau_src = terminal_time(
         _label_src,
         job_start=targets["jst"],
@@ -1121,24 +1020,39 @@ if __name__ == "__main__":
     )
     n_fb = int((tau_src == 2).sum())
     print(f"Label-observation basis: {args.experiment} uses "
-          f"{'JobStartDate' if args.experiment in ('e2', 'e2dist') else 'CompletionDate'}; "
+          f"{'JobStartDate' if args.experiment == 'e2' else 'CompletionDate'}; "
           f"{n_fb:,} rows ({n_fb / len(tau) * 100:.1f}%) fall back to QDate as a "
           f"lower bound (removed before ever starting).")
     tr_t, te_t, _tstats = temporal_masks(QS, CUTOFF_EPOCH, label_time=tau)
     tri_t, tei_t = np.where(tr_t)[0], np.where(te_t)[0]
     print(f"Temporal split at {CUTOFF_LABEL}: train {len(tri_t):,} | test {len(tei_t):,}")
 
-    # 2. Random split indices
-    rng = np.random.default_rng(0)
-    perm = rng.permutation(idx)
-    rte = np.sort(perm[: len(tei_t)])
-    rtr = np.sort(perm[len(tei_t) :])
+    # 2. Both protocol arms, plus the shared out-of-time slice, from eval/splits.py --
+    # the same builder eval/dataset.py and feat-engineering.ipynb call. This used to be
+    # a third, inline definition here (a whole-window permutation under a different
+    # seed), so the sweeps ran a different split from everything else.
+    _sp = build_splits(tri_t, tei_t, order=tau, n_rows=len(QS))
+    OOT = _sp.pop("oot")
+
+    # Which code columns get native categorical treatment, decided ONCE from
+    # pre-cutoff rows. Deciding per arm would let a column near the cardinality
+    # threshold fall on different sides for the two protocols, which would make the
+    # arms differ in more than the thing under test.
+    _cat_src = Xsub if args.experiment == "e2" else Xmatch
+    _ncat_src = NCAT_SUB if args.experiment == "e2" else NCAT_MATCH
+    # step=1 because the rows are already thinned here; letting _cat_idx thin again
+    # would count levels on too few rows and admit columns over the limit.
+    _cat_rows = tri_t[::40]
+    CAT_IDX = _cat_idx(_ncat_src, np.asarray(_cat_src[_cat_rows]), step=1)
+    print(f"categorical columns ({len(CAT_IDX)} of {_ncat_src}, <= {CAT_MAX_LEVELS} "
+          f"levels in {len(_cat_rows):,} pre-cutoff rows): {CAT_IDX}")
+    rtr, rte = _sp["random"]
 
     SPLITS = []
     if args.split in ("random", "both"):
         SPLITS.append(("random", rtr, rte))
     if args.split in ("temporal", "both"):
-        SPLITS.append(("temporal", tri_t, tei_t))
+        SPLITS.append(("temporal", *_sp["temporal"]))
 
     if RAN is not None and args.experiment in ("e1", "e3"):
         _before = sum(len(a) + len(b) for _, a, b in SPLITS)
@@ -1147,14 +1061,12 @@ if __name__ == "__main__":
         print(f"Target mask (Ran): {_before - _after:,} never-ran rows removed from the "
               f"{args.experiment.upper()} population; they remain in the feature matrices "
               f"as queue context.", flush=True)
-        for nm, a, b in SPLITS:
-            print(f"  {nm:9s} train {len(a):>12,} | test {len(b):>12,}", flush=True)
 
     IMP = {}
-    print(
-        f"Splits prepared: Random ({len(rtr):,} train / {len(rte):,} test) | "
-        f"Temporal ({len(tri_t):,} train / {len(tei_t):,} test)"
-    )
+    for nm, a, b in SPLITS:
+        print(f"  {nm:9s} train {len(a):>12,} | test {len(b):>12,}", flush=True)
+    if args.experiment == "e2":
+        print(f"  {'oot':9s} {'':>18s} | test {len(OOT):>12,}", flush=True)
 
     n_tot = len(failed)
     n_fail = int(np.sum(failed == 1))
@@ -1162,21 +1074,18 @@ if __name__ == "__main__":
     n_payload = n_fail - n_hw
     ftype = targets["fault_type"] if "fault_type" in targets else None
 
-    if ftype is not None:
+    if ftype is not None and args.experiment in ("e1", "e3", "cascade"):
         n_succ = int(np.sum(ftype == -1))
         n_cancel = int(np.sum(ftype == -2))
         n_app = int(np.sum(ftype == 0))
         n_sub = int(np.sum(ftype == 2))
-        n_completed = n_tot - n_cancel
 
         print(
-            f"  ├─ Clean Successes       : {n_succ:,} ({n_succ/n_tot*100:.2f}%)\n",
-            f"  ├─ Voluntary User Cancels: {n_cancel:,} ({n_cancel/n_tot*100:.2f}%)\n",
-            f"  └─ Genuine Failures      : {n_fail:,} ({n_fail/n_tot*100:.2f}% of total)\n",
-            f"-"*50,
-            f"\nFailure rate (excl. user removal): {n_fail/(n_tot-n_cancel)*100:.2f}%\n",
-            f"-"*50,
-        )
+            f"  ├─ Clean Successes       : {n_succ:,} ({n_succ/n_tot*100:.2f}%)\n"
+            f"  ├─ Voluntary User Cancels: {n_cancel:,} ({n_cancel/n_tot*100:.2f}%)\n"
+            f"  └─ Genuine Failures      : {n_fail:,} ({n_fail/n_tot*100:.2f}% of total)\n"
+            f"  Failure rate (excl. user removal): "
+            f"{n_fail/(n_tot-n_cancel)*100:.2f}%", flush=True)
 
     if args.experiment == "cascade":
         e1_lib, _, e3_lib = args.model.partition(":")
@@ -1199,28 +1108,14 @@ if __name__ == "__main__":
         print(f"Running Experiment E2 (Wait Time Regression) [{args.model}]")
         # Floor first: a single constant already reaches within-2x ~ 0.25 on this
         # distribution, so the model numbers below are only interpretable next to it.
-        print("Reference predictors (no features):")
-        run_e2_reference(wait_log, SPLITS)
         _got = {}
         for sd in SEEDS:
             _got.update(run_e2_model(
-                args.model, Xsub, wait_log, SPLITS, IMP, NCAT_SUB, order=QS, seed=sd
+                args.model, Xsub, wait_log, SPLITS, IMP, NCAT_SUB, order=QS,
+                seed=sd, oot=OOT, cat_idx=CAT_IDX
             ) or {})
         report_seed_variance(_got, ["r2_log", "within2x", "mae_log1p", "median_ae_s"],
                              label=f" [e2/{args.model}]")
-
-    elif args.experiment == "e2dist":
-        print(f"Running Experiment E2dist (Wait Time Intervals, {args.head} head) "
-              f"[{args.model}]")
-        print("Reference predictors (no features):")
-        run_e2_reference(wait_log, SPLITS)
-        # Never-ran jobs are right-censored, not missing: their wait is known only
-        # to exceed the point at which they left the queue. Only the AFT head can
-        # use them, and only if the RAN mask is available here.
-        CENS = (~RAN) if (args.head == "aft" and "RAN" in dir() and RAN is not None) else None
-        for sd in SEEDS:
-            run_e2_dist(args.model, Xsub, wait_log, SPLITS, NCAT_SUB,
-                        head=args.head, censored=CENS, order=QS, seed=sd)
 
     elif args.experiment == "e3":
         if ftype is not None:

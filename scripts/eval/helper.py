@@ -15,7 +15,7 @@ from sklearn.metrics import (
 )
 import matplotlib.pyplot as plt
 import seaborn as sns
-from eval.paths import DATA_ROOT, all_model_dirs as _all_model_dirs
+from eval.paths import DATA_ROOT, RESULTS_DIR, all_model_dirs as _all_model_dirs
 
 MODEL_DISPLAY_NAMES = {
     "xgboost": "XGBoost",
@@ -33,6 +33,32 @@ MODEL_DISPLAY_NAMES = {
     "tabr": "TabR",
     "hierarchical": "Hierarchical",
 }
+
+# Attribution is not the same measurement in each family: trees report split gain,
+# TabNet reports attention mass, and the remaining neural models report the AUC drop
+# under permutation. All three are normalised to sum to 1, so a shift is in
+# percentage points either way -- but a 5-point move in gain share and a 5-point move
+# in permutation share are different phenomena, which is why they are plotted apart.
+MODEL_FAMILIES = {
+    "tree": ["xgboost", "xgb", "lightgbm", "lgb", "catboost", "cat"],
+    "neural": ["mlp", "tabnet", "saint", "ft", "ft_transformer", "tsmixer", "tabr",
+               "hierarchical"],
+}
+
+FAMILY_LABELS = {
+    "tree": "Gradient-boosted trees (split gain)",
+    "neural": "Neural models (permutation importance; TabNet: attention mass)",
+}
+
+
+def model_family(name):
+    """'tree', 'neural', or None for a model this module does not classify."""
+    low = str(name).lower()
+    for fam, members in MODEL_FAMILIES.items():
+        if low in members:
+            return fam
+    return None
+
 
 PREFERRED_MODEL_ORDER = [
     "xgboost",
@@ -257,42 +283,8 @@ def mixture_quantile_s(q, mix=None, lo=1e-3, hi=1e7, n=200_000):
     return np.interp(np.asarray(q, dtype=np.float64), mixture_cdf_s(grid, mix), grid)
 
 
-def pinball_loss(y_true_log, pred_log_by_tau):
-    """Mean pinball (quantile) loss in log1p space, averaged over the quantiles.
-
-    `pred_log_by_tau` maps tau -> row-aligned predictions. The mixture fit puts a
-    conditional SD of ~1.17 in log space even when the component is known, so a
-    point estimate is the wrong output object for this task; pinball is the loss a
-    set of quantile heads actually optimises, and it is what makes two interval
-    predictors comparable. Returns the per-tau losses and their mean.
-    """
-    y = np.asarray(y_true_log, dtype=np.float64)
-    per = {}
-    for tau, pred in sorted(pred_log_by_tau.items()):
-        d = y - np.asarray(pred, dtype=np.float64)
-        per[float(tau)] = float(np.mean(np.maximum(tau * d, (tau - 1.0) * d)))
-    return {"pinball_per_tau": per,
-            "pinball_mean": float(np.mean(list(per.values()))) if per else float("nan")}
 
 
-def interval_metrics(y_true_log, lo_log, hi_log):
-    """Coverage and width of a predicted interval, in log1p space.
-
-    `coverage` is the fraction of jobs whose true wait falls inside [lo, hi]; for
-    heads fitted at tau = 0.1/0.9 an honest model lands near 0.80. `width_log` is
-    the mean interval width in log1p units, so exp(width_log) is the multiplicative
-    factor the interval spans -- the number a user actually feels.
-    """
-    y = np.asarray(y_true_log, dtype=np.float64)
-    lo = np.asarray(lo_log, dtype=np.float64)
-    hi = np.asarray(hi_log, dtype=np.float64)
-    w = np.maximum(hi - lo, 0.0)
-    return {
-        "coverage": float(np.mean((y >= lo) & (y <= hi))),
-        "width_log": float(np.mean(w)),
-        "width_factor": float(np.exp(np.mean(w))),
-        "median_width_factor": float(np.exp(np.median(w))),
-    }
 
 
 def best_constant_log(y_true_log, metric="within2x"):
@@ -660,7 +652,7 @@ def collect_seed_runs(exp_name, lib, split, results_dir=None):
     "<split>__seed<N>" (the rest), so this pulls them back together for
     `aggregate_seeds`.
     """
-    results_dir = results_dir if results_dir is not None else os.path.join(os.getcwd(), "results")
+    results_dir = results_dir if results_dir is not None else RESULTS_DIR
     path = os.path.join(results_dir, f"{exp_name}_results.json")
     with open(path) as f:
         data = json.load(f)
@@ -1110,6 +1102,12 @@ def thr_sample(a, max_n=500_000, seed=42):
         return np.random.default_rng(seed).choice(a, max_n, replace=False)
     return a
 
+
+# Fixed epoch budget for every neural trainer. Nothing selects an epoch count from
+# data, so there is no validation set for E2 and no refit: each model trains this many
+# epochs on its arm's full training window and is scored once. Uniform across models
+# and across split protocols, which is what makes the two arms comparable.
+NEURAL_EPOCHS = int(os.environ.get("FIFE_NEURAL_EPOCHS", "5"))
 
 VAL_FRAC = 0.10
 
@@ -2605,6 +2603,21 @@ def imp_heatmap(
 
     return df
 
+def imp_diff_heatmaps_by_family(imp_dict, feats, **kw):
+    """Render the gain-shift heatmap once per model family.
+
+    Returns {family: DataFrame}. Families with no models present are skipped.
+    """
+    out = {}
+    base_title = kw.pop("title", "Feature Gain Shift: Random vs. Temporal Split Protocol")
+    for fam in ("tree", "neural"):
+        df = imp_diff_heatmap(imp_dict=imp_dict, feats=feats, family=fam,
+                              title=base_title, **kw)
+        if df is not None:
+            out[fam] = df
+    return out
+
+
 def imp_diff_heatmap(
     imp_dict: dict,
     feats: list[str],
@@ -2614,14 +2627,30 @@ def imp_diff_heatmap(
     cardinality_threshold: int = 50,
     models: list[str] = None,
     title: str = "Feature Gain Shift: Random vs. Temporal Split Protocol",
-    min_importance_threshold: float = 0.1,  # Filters features with max absolute shift < 0.1
+    min_importance_threshold: float = None,
     output_prefix: str = "imp_diff_heatmap_side_by_side",
+    per_model_scale: bool = True,
+    family: str = None,
 ):
-    """Renders heatmaps comparing (Temporal - Random) feature importance shifts,
+    """Renders heatmaps comparing (Temporal - Random) feature importance shifts.
 
-    optionally splitting columns side-by-side into Categorical vs.
-    Numerical/Dynamic features.
+    `per_model_scale=True` (the default) gives every model its own row, its own
+    colour scale and its own colorbar, with values in percentage points of that
+    model's total importance. This is the form to use in the paper. The alternative
+    -- one shared colorbar over rows that have each been divided by their own maximum
+    -- invites a cross-model colour comparison that the scaling makes meaningless,
+    which is what made the earlier version hard to read.
+
+    `family` selects "tree" or "neural" (see MODEL_FAMILIES). The two measure
+    importance differently and are not on a common footing, so they are plotted
+    separately; `imp_diff_heatmaps_by_family` renders both in one call.
+
+    With `per_model_scale=False` the columns are additionally split side-by-side into
+    Categorical vs. Numerical/Dynamic features.
     """
+    # Percentage points when per-model, fraction-of-max when normalised.
+    if min_importance_threshold is None:
+        min_importance_threshold = 0.2 if per_model_scale else 0.1
 
     # Helper function to convert arrays/dicts to aligned pandas Series
     def _clean_and_normalize(val):
@@ -2658,6 +2687,12 @@ def imp_diff_heatmap(
         ):
             ordered_models.append(m)
 
+    if family is not None:
+        if family not in MODEL_FAMILIES:
+            raise ValueError(f"family must be one of {sorted(MODEL_FAMILIES)}, got {family!r}")
+        members = set(MODEL_FAMILIES[family])
+        ordered_models = [m for m in ordered_models if m.lower() in members]
+
     rows = {}
     for m in ordered_models:
         imp_rand = _clean_and_normalize(imp_dict[(m, "random")])
@@ -2666,10 +2701,15 @@ def imp_diff_heatmap(
         # Feature gain shift (Temporal - Random)
         delta = imp_temp - imp_rand
 
-        # Row-wise Max-Abs scaling: Maps each model's maximum shift to [-1.0, +1.0]
-        max_abs = np.nanmax(np.abs(delta.values))
-        if max_abs > 0:
-            delta = delta / max_abs
+        if per_model_scale:
+            # Percentage points of that model's total importance. Readable as-is and
+            # comparable within a row; no cross-row rescaling to misinterpret.
+            delta = delta * 100.0
+        else:
+            # Row-wise Max-Abs scaling: maps each model's maximum shift to [-1, +1]
+            max_abs = np.nanmax(np.abs(delta.values))
+            if max_abs > 0:
+                delta = delta / max_abs
 
         disp_name = display_names.get(m.lower(), m)
         rows[disp_name] = delta
@@ -2759,7 +2799,52 @@ def imp_diff_heatmap(
 
     # --- Step 3: Render Heatmap(s) ---
     sns.plotting_context("talk")
-    plt.rcParams.update({"font.family": "serif"})
+
+    if per_model_scale:
+        # One row per model, each with its own symmetric scale and its own colorbar.
+        df_p = pd.concat([df_cat, df_non_cat], axis=1)
+        df_p = df_p[df_p.abs().max(axis=0).sort_values(ascending=False).index]
+        n_models = len(df_p.index)
+
+        # constrained layout, not tight_layout: seaborn attaches a colorbar axes to
+        # every row, and tight_layout cannot place those (it warns and may shift the
+        # annotations out of their cells).
+        fig, axes = plt.subplots(
+            n_models, 1,
+            figsize=(4 + 0.9 * len(df_p.columns), 1.5 * n_models + 1.2),
+            sharex=True, squeeze=False, layout="constrained",
+        )
+        for i, model_name in enumerate(df_p.index):
+            ax = axes[i, 0]
+            row_df = df_p.loc[[model_name]]
+            lim = float(np.nanmax(np.abs(row_df.values))) or 1.0
+            is_last = i == n_models - 1
+            sns.heatmap(
+                row_df, cmap="vlag", center=0, vmin=-lim, vmax=lim,
+                annot=True, fmt=".2f", annot_kws={"size": 14},
+                cbar_kws={"label": "\u0394 (pp)", "shrink": 0.85, "pad": 0.01},
+                linewidths=0.5, linecolor="white",
+                xticklabels=df_p.columns if is_last else False, ax=ax,
+            )
+            ax.tick_params(length=0)
+            ax.set_ylabel("")
+            ax.set_yticklabels(ax.get_yticklabels(), rotation=0,
+                               fontweight="bold", fontsize=16)
+            if is_last:
+                ax.set_xticklabels(ax.get_xticklabels(), rotation=45,
+                                   ha="right", fontsize=16)
+
+        sub = FAMILY_LABELS.get(family)
+        fig.suptitle(f"{title}\n{sub}" if sub else title, fontsize=20)
+
+        figures_dir = os.path.join(os.getcwd(), "output")
+        os.makedirs(figures_dir, exist_ok=True)
+        stem = f"{output_prefix}_{family}" if family else output_prefix
+        plt.savefig(os.path.join(figures_dir, f"{stem}.pdf"), bbox_inches="tight")
+        plt.savefig(os.path.join(figures_dir, f"{stem}.png"),
+                    bbox_inches="tight", dpi=300)
+        plt.show()
+        return df_p
 
     # Fallback to single subplot if all features fell into one category
     if df_cat.empty or df_non_cat.empty:
@@ -2914,43 +2999,3 @@ def imp_diff_heatmap(
     plt.show()
 
     return df
-
-
-if __name__ == "__main__":
-    DATA_DIR = DATA_ROOT
-    targets = np.load(os.path.join(DATA_DIR, "targets_and_masks.npz"))
-
-    Xmatch = np.load(os.path.join(DATA_DIR, "Xmatch.npy"), mmap_mode="r")
-    Xsub = np.load(os.path.join(DATA_DIR, "Xsub.npy"), mmap_mode="r")
-
-    failed = np.load(os.path.join(DATA_DIR, "failed.npy"), mmap_mode="r")
-    hw = np.load(os.path.join(DATA_DIR, "hw.npy"), mmap_mode="r")
-    wait_sv = np.load(os.path.join(DATA_DIR, "wait_sv.npy"), mmap_mode="r")
-    tr_mask = np.load(os.path.join(DATA_DIR, "tr_mask.npy"), mmap_mode="r")
-    te_mask = np.load(os.path.join(DATA_DIR, "te_mask.npy"), mmap_mode="r")
-
-    yv = failed
-    idx = np.arange(len(yv))
-
-    # Temporal split indices
-    tri_t = np.where(tr_mask)[0]
-    tei_t = np.where(te_mask)[0]
-
-    # Random split indices
-    rng = np.random.default_rng(0)
-    perm = rng.permutation(idx)
-    rte = np.sort(perm[: len(tei_t)])
-    rtr = np.sort(perm[len(tei_t) :])
-
-    print(f"Data loaded: Total {len(yv):,} rows | Feature matrix {Xmatch.shape}")
-    print(f"Random split: {len(rtr):,} train / {len(rte):,} test")
-    print(f"Temporal split: {len(tri_t):,} train / {len(tei_t):,} test")
-
-    evaluate_protocol_models(
-        X_all=Xmatch,
-        y_all=yv,
-        rtr=rtr,
-        rte=rte,
-        tri_t=tri_t,
-        tei_t=tei_t
-    )

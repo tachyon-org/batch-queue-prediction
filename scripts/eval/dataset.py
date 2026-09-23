@@ -14,6 +14,7 @@ import numpy as np
 
 from eval.helper import temporal_masks, terminal_time
 from eval.paths import DATA_ROOT
+from eval.splits import build_splits
 
 # 2025-07-01 00:00 UTC, the deployment cutoff the temporal protocol simulates.
 DEFAULT_CUTOFF = "2025-07-01"
@@ -23,7 +24,7 @@ WINDOW_FLOOR = 1735689600
 # harness and in any notebook; it is deliberately NOT tied to the model seed.
 SPLIT_RNG_SEED = 0
 
-_SUBMIT_TIME_EXPERIMENTS = ("e2", "e2dist")
+_SUBMIT_TIME_EXPERIMENTS = ("e2",)
 
 
 def cutoff_epoch(cutoff=DEFAULT_CUTOFF):
@@ -54,20 +55,22 @@ class ExperimentData:
         """The feature matrix this experiment actually uses."""
         return self.Xsub if self.experiment in _SUBMIT_TIME_EXPERIMENTS else self.Xmatch
 
+    def out_of_time(self):
+        """The shared out-of-time test slice, scored by both arms, trained on by
+        neither. Empty under the legacy design."""
+        return getattr(self, "oot", np.array([], dtype=np.int64))
+
     def __repr__(self):
         s = "  ".join(f"{k}: train {len(a):,} / test {len(b):,}"
                       for k, (a, b) in self.splits.items())
-        return f"<ExperimentData {self.experiment} @ {self.cutoff}  {s}>"
+        n_oot = len(self.out_of_time())
+        return (f"<ExperimentData {self.experiment} @ {self.cutoff}  {s}"
+                + (f"  oot: {n_oot:,}" if n_oot else "") + ">")
 
 
 def load_experiment(experiment="e2", cutoff=DEFAULT_CUTOFF, data_root=None,
                     mmap=True, verbose=True):
     """Loads the data and reproduces the harness's splits for `experiment`.
-
-    The split logic here is the same as eval/harness.py's: cut on label-observation
-    time, then draw a random split of identical size with a fixed generator, then
-    (for e1/e3 only) drop never-ran rows from the target population while leaving
-    them in the matrices as queue context.
     """
     root = data_root or DATA_ROOT
     mm = "r" if mmap else None
@@ -98,12 +101,11 @@ def load_experiment(experiment="e2", cutoff=DEFAULT_CUTOFF, data_root=None,
     tr_t, te_t, _ = temporal_masks(qs, cut, label_time=tau, verbose=verbose)
     tri_t, tei_t = np.where(tr_t)[0], np.where(te_t)[0]
 
-    rng = np.random.default_rng(SPLIT_RNG_SEED)
-    perm = rng.permutation(np.arange(len(qs)))
-    rte = np.sort(perm[: len(tei_t)])
-    rtr = np.sort(perm[len(tei_t):])
-
-    splits = {"random": (rtr, rte), "temporal": (tri_t, tei_t)}
+    # Both arms come from eval/splits.py, which feat-engineering.ipynb also calls,
+    # so the notebook that writes the matrices and this loader cannot disagree.
+    _sp = build_splits(tri_t, tei_t, order=tau, n_rows=len(qs), verbose=verbose)
+    oot = _sp.pop("oot")
+    splits = _sp
 
     ran = None
     ran_path = os.path.join(root, "ran.npy")
@@ -121,7 +123,7 @@ def load_experiment(experiment="e2", cutoff=DEFAULT_CUTOFF, data_root=None,
         experiment=experiment, cutoff=cutoff, cutoff_epoch=cut, root=root,
         Xmatch=_load("Xmatch.npy"), Xsub=_load("Xsub.npy"),
         failed=targets["failed"], hw=targets["hw"], fault_type=targets["fault_type"],
-        wait_sv=wait_sv, wait_log=np.log1p(np.maximum(wait_sv, 0)),
+        wait_sv=wait_sv, wait_log=np.log1p(np.maximum(wait_sv, 0)), oot=oot,
         qs=qs, jst=targets["jst"], comp=targets["comp"], ran=ran,
         splits=splits, schema=schema,
         xmatch_cols=schema.get("XMATCH_COLS"), xsub_cols=schema.get("XSUB_COLS"),
