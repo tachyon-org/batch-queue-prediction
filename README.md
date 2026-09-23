@@ -107,10 +107,12 @@ models/
 
 ### How to run
 
-All training and evaluation tasks are managed through the CLI in `scripts/eval/harness.py`:
+All training and evaluation tasks are managed through the CLI in `scripts/eval/harness.py`.
+Run it as a module with `scripts/` as the working directory:
 
 ```
-python scripts/eval/harness.py <experiment> <model> [split]
+cd scripts
+python3 -m eval.harness <experiment> <model> [split]
 ```
 
 #### Arguments
@@ -147,7 +149,6 @@ Run from `scripts/` with the package on the path:
 
 ```
 cd scripts
-export PYTHONPATH="$PWD"
 ```
 
 1. Job failure classification using XGBoost, both splits:
@@ -159,7 +160,7 @@ python3 -m eval.harness e1 xgboost both
 2. Five seeds, logged to W&B:
 
 ```
-python3 -m eval.harness e1 xgboost both --seeds 0,1,2,3,4 --wandb
+python3 -m eval.harness e1 xgboost both --seeds 0,1,2 --wandb
 ```
 
 3. Cutoff sensitivity -- same protocol, different deployment date:

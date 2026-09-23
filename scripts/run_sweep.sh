@@ -30,7 +30,8 @@ fi
 echo "wandb: $([ "$WANDB" = 1 ] && echo enabled || echo disabled)"
 
 # Trees first: fast, and they surface data problems before the expensive fits start.
-MODELS=(xgboost lightgbm catboost mlp tabnet saint ft tsmixer)
+# Override to run a subset, e.g.  MODELS="xgboost lightgbm catboost" ./run_sweep.sh
+read -r -a MODELS <<< "${MODELS:-xgboost lightgbm catboost mlp tabnet saint ft tsmixer}"
 
 echo "sweep -> $LOGDIR  (seeds $SEEDS)"
 for exp in e1 e3; do
@@ -48,24 +49,13 @@ done
 
 # The harness prints the no-feature reference floor before each model's numbers.
 echo
-echo "=== E2 wait time (point + interval heads) ==="
+echo "=== E2 wait time ==="
 for m in "${MODELS[@]}"; do
   log="$LOGDIR/e2_${m}.log"
   echo "=== e2 / $m ==="
   python3 -m eval.harness e2 "$m" both --seeds "$SEEDS" "${WB_ARGS[@]}" >"$log" 2>&1 \
     && grep -E "ref:|R2\(log\)" "$log" | tail -6 \
     || { echo "  FAILED -- see $log"; tail -5 "$log" | sed 's/^/    /'; }
-done
-
-for m in xgboost lightgbm; do
-  for head in quantile aft; do
-    log="$LOGDIR/e2dist_${m}_${head}.log"
-    echo "=== e2dist / $m / $head ==="
-    python3 -m eval.harness e2dist "$m" both --head "$head" \
-         --seeds "$SEEDS" "${WB_ARGS[@]}" >"$log" 2>&1 \
-      && grep -E "Pinball|Cover|censored" "$log" | tail -4 \
-      || { echo "  FAILED -- see $log"; tail -5 "$log" | sed 's/^/    /'; }
-  done
 done
 
 # Temporal only: the random split has no cutoff.

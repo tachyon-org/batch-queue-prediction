@@ -1,0 +1,33 @@
+# Filesystem roots for datasets, saved models and saved predictions.
+#
+# Copy to paths.yaml and edit. paths.yaml is gitignored, so machine-specific
+# locations stay out of the repository.
+#
+#     cp scripts/config/paths.yaml.example scripts/config/paths.yaml
+#
+# Resolution order: environment variable, then this file, then a repo-relative
+# default. Any key may be omitted to fall back to the default.
+#
+#     FIFE_DATA_ROOT   -> data_root     (default: scripts/data)
+#     FIFE_MODEL_ROOT  -> model_root    (default: scripts/models)
+#     FIFE_PRED_ROOT   -> pred_root     (default: scripts/predictions)
+#
+# Training memory-maps tens of GB out of data_root repeatedly. On a cluster,
+# point these at fast local storage (an NVMe scratch mount) rather than a shared
+# network filesystem, and note that node-local storage is not visible from other
+# nodes -- each machine needs its own copy and its own paths.yaml.
+#
+# A shared/NFS checkout is visible from several machines, but node-local storage
+# is not. Point FIFE_PATHS_CONFIG at a per-host file when one paths.yaml cannot
+# serve them all, or set the environment variables in the job script.
+#
+# Check what resolved with:  cd scripts && python3 -m eval.paths
+
+# Feature matrices, targets and schema_meta.json.
+data_root: /path/to/datasets/fife
+
+# Saved models, one directory per experiment and model.
+model_root: /path/to/models
+
+# Saved test-set predictions.
+pred_root: /path/to/predictions

@@ -164,6 +164,11 @@ def load_jobs(raw_dir=RAW_DIR, qmin_s=WINDOW_START_S):
             pl.when(
                 rr_lower.str.contains("exceeding job limits")
                 | rr_lower.str.contains("opportunistic")
+                # Sandbox transfer never completed, so the payload never ran. These
+                # reached .otherwise(1) below and were filed as hardware: 227,795 of
+                # them, 30% of the raw hardware tally, all on jobs that never started.
+                | rr_lower.str.contains("staging of job files failed")
+                | rr_lower.str.contains("spooling is taking too long")
             ).then(2)
             .when(
                 rr_lower.str.contains("otherjobremoverequirements")
@@ -171,7 +176,7 @@ def load_jobs(raw_dir=RAW_DIR, qmin_s=WINDOW_START_S):
                 | rr_lower.str.contains("held 14 days")
                 | rr_lower.str.contains("periodicremove")
             ).then(0)
-            .otherwise(1)  # unrecognised system removal -> Hardware
+            .otherwise(1)  # unrecognised system removal -> Hardware (see above)
         )
         # 7. HOLD REASONS
         .when(lhr.is_in(HOLD_SUB)).then(2)

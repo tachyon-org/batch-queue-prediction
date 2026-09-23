@@ -14,6 +14,9 @@ paper/
 
 # W&B: filled-in config (credentials) and run scratch; the .example is committed.
 scripts/config/wandb.yaml
+
+# Filesystem roots: machine-specific, the .example is committed.
+scripts/config/paths.yaml
 wandb/
 
 # Run logs from long-running experiment sweeps (see MODELING.md)
