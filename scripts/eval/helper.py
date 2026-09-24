@@ -1109,6 +1109,17 @@ def thr_sample(a, max_n=500_000, seed=42):
 # and across split protocols, which is what makes the two arms comparable.
 NEURAL_EPOCHS = int(os.environ.get("FIFE_NEURAL_EPOCHS", "5"))
 
+# Categorical embeddings for the neural models, OFF by default. Measured on 10.7M
+# rows, embedding the code columns costs R2_log on BOTH split arms while reaching
+# LOWER training loss -- memorising entity identity that does not recur after the
+# cutoff:
+#     arm       no cat    low-cardinality only    all columns
+#     random    +0.764    +0.288                  +0.442
+#     temporal  +0.177    -11.647                 -0.029
+# Every saved model in Pre-Trained-Models/neural-models/old_082026 also has
+# cat_idxs=[]. Set FIFE_NEURAL_CAT=1 to re-enable across all neural trainers.
+NEURAL_CAT = os.environ.get("FIFE_NEURAL_CAT", "0") not in ("0", "false", "False")
+
 VAL_FRAC = 0.10
 
 
@@ -2999,3 +3010,114 @@ def imp_diff_heatmap(
     plt.show()
 
     return df
+
+
+# ---- Feature-matrix standardisation ----------------------------------------
+# The "(std)" columns are scaled when the matrix is built and the sin/cos encodings
+# are bounded by construction, but the trailing rates and log running-counts are
+# written raw -- log_idle_queue_depth lands around mean 10.5 / sd 1.2 beside features
+# at mean 0 / sd 1. Boosted trees do not care (the transform is monotonic); the neural
+# models cannot fit inputs spanning two orders of magnitude.
+#
+# feat-engineering.ipynb applies this when a matrix is built. These helpers apply it
+# in place to a matrix that already exists, so an 18 GB rebuild is not needed.
+
+_STD_SKIP_MARKERS = ("(std)",)
+_STD_SKIP_PREFIXES = ("sin_", "cos_")
+
+_STD_MATRICES = {
+    "Xmatch": {"ncat": "NCAT_MATCH", "cols": "XMATCH_COLS",
+               "split": "e1e3__temporal__train"},
+    "Xsub": {"ncat": "NCAT_SUB", "cols": "XSUB_COLS",
+             "split": "e2__temporal__train"},
+}
+
+
+def standardize_targets(cols, first):
+    """Indices of the numeric columns in `cols` that still need scaling."""
+    out = []
+    for j in range(first, len(cols)):
+        name = cols[j]
+        if any(m in name for m in _STD_SKIP_MARKERS):
+            continue
+        if any(name.startswith(p) for p in _STD_SKIP_PREFIXES):
+            continue
+        out.append(j)
+    return out
+
+
+def standardize_matrices(data_root=None, matrices=None, sample_step=50,
+                         chunk_rows=8_000_000, dry_run=False, force=False,
+                         verbose=True):
+    """Standardise trailing/running columns of the saved matrices, in place.
+
+    Mean and sd come from pre-cutoff training rows only (via splits.npz), so the
+    scaler never sees the test period. The applied values are recorded under the
+    SCALERS key of schema_meta.json, which also makes this idempotent: a matrix whose
+    scalers are already recorded is skipped unless `force` is set.
+
+    Do not run this while a training job has the matrices memory-mapped -- the job
+    would read half-rescaled data. Returns the scaler dict.
+    """
+    root = data_root or DATA_ROOT
+    meta_path = os.path.join(root, "schema_meta.json")
+    with open(meta_path) as fh:
+        meta = json.load(fh)
+    splits = np.load(os.path.join(root, "splits.npz"))
+    recorded = meta.get("SCALERS") or {}
+    if recorded and not force:
+        if verbose:
+            print(f"schema_meta.json already records {len(recorded)} scalers; "
+                  f"nothing to do (pass force=True to re-apply).")
+        return recorded
+
+    scalers = dict(recorded) if force else {}
+    for name in (matrices or sorted(_STD_MATRICES)):
+        spec = _STD_MATRICES[name]
+        path = os.path.join(root, f"{name}.npy")
+        if not os.path.exists(path):
+            if verbose:
+                print(f"[skip] {path} not found")
+            continue
+        cols, ncat = meta[spec["cols"]], meta[spec["ncat"]]
+        M = np.load(path, mmap_mode="r" if dry_run else "r+")
+        if M.shape[1] != len(cols):
+            if verbose:
+                print(f"[skip] {name}: matrix has {M.shape[1]} columns but schema "
+                      f"lists {len(cols)} -- regenerate before patching")
+            continue
+        fit_rows = splits[spec["split"]][::sample_step]
+        todo = standardize_targets(cols, ncat)
+        if verbose:
+            print(f"\n{name} {M.shape}: {len(todo)} column(s) on "
+                  f"{len(fit_rows):,} pre-cutoff rows")
+        for j in todo:
+            col = np.asarray(M[fit_rows, j], dtype=np.float64)
+            mu = float(np.nanmean(col))
+            sd = float(np.nanstd(col)) or 1.0
+            if verbose:
+                print(f"  {cols[j]:34s} mean {mu:10.4f}  sd {sd:9.4f}"
+                      f"{'   (dry run)' if dry_run else ''}")
+            if dry_run:
+                continue
+            for a in range(0, M.shape[0], chunk_rows):
+                b = min(a + chunk_rows, M.shape[0])
+                M[a:b, j] = (M[a:b, j] - mu) / sd
+            scalers[cols[j]] = {"mean": mu, "sd": sd}
+        if not dry_run:
+            M.flush()
+        del M
+
+    if dry_run:
+        if verbose:
+            print("\nDry run: nothing written.")
+        return scalers
+
+    meta["SCALERS"] = scalers
+    tmp = meta_path + ".partial"
+    with open(tmp, "w") as fh:
+        json.dump(meta, fh, indent=2)
+    os.replace(tmp, meta_path)
+    if verbose:
+        print(f"\nRecorded {len(scalers)} scalers in {meta_path}")
+    return scalers

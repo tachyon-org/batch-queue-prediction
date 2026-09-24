@@ -3,6 +3,7 @@ import gc
 import numpy as np
 import torch
 from eval.helper import _empty_gpu, _get_slice
+from eval.helper import NEURAL_EPOCHS, NEURAL_CAT
 from pytorch_tabnet.tab_model import TabNetClassifier, TabNetRegressor
 from eval.wandb_logger import log_epoch, log_summary
 from pytorch_tabnet.callbacks import Callback
@@ -12,7 +13,7 @@ from eval.paths import model_path
 
 def tabnet_fit_eval(
     parts, tri, tei, ncat, kind, y, spw=None, trs=None, want_imp=False, split=None,
-    exp_tag=None, seed=42, refit_idx=None
+    exp_tag=None, seed=42, full_train_idx=None
 ):
     split = split if split is not None else "default"
     DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -22,6 +23,13 @@ def tabnet_fit_eval(
 
     print(f"device={DEV} | split={split} | kind={kind}", flush=True)
 
+    # Fixed epoch budget: train once on the full window. This MUST happen before the
+    # slice below: slicing first pairs features from the 90% fit set with labels from
+    # the full window, and pytorch_tabnet accepts mismatched lengths without raising,
+    # so the model silently trains on misaligned rows and can only learn the mean.
+    if full_train_idx is not None:
+        tri = np.asarray(full_train_idx)
+
     Xtr = _get_slice(parts, tri)
     X_te = _get_slice(parts, tei)
     X_trs = _get_slice(parts, trs) if trs is not None else None
@@ -30,25 +38,67 @@ def tabnet_fit_eval(
     X_te_np = np.asarray(X_te, dtype=np.float32)
     X_trs_np = np.asarray(X_trs, dtype=np.float32) if X_trs is not None else None
 
+    # Categorical embeddings are OFF by default, and that is a measured decision, not
+    # an oversight. On 10.7M rows, embedding the code columns costs R2_log on BOTH
+    # arms while reaching LOWER training loss -- the signature of memorising entity
+    # identity that does not recur after the cutoff:
+    #
+    #     arm       no cat    low-cardinality only    all columns (1.8M)
+    #     random    +0.764    +0.288                  +0.442
+    #     temporal  +0.177    -11.647                 -0.029
+    #
+    # Restricting to low-cardinality columns (the rule the trees use) does not help;
+    # it is worse. Every saved model in Pre-Trained-Models/neural-models/old_082026
+    # also has cat_idxs=[], which is why those runs scored positive.
+    # Set FIFE_NEURAL_CAT=1 to re-enable across all neural trainers.
     cat_idxs, cat_dims = [], []
-    if isinstance(ncat, int) and ncat > 0:
+    if NEURAL_CAT and isinstance(ncat, int) and ncat > 0:
         cat_idxs = list(range(ncat))
-        cat_dims = [
-            int(max(Xtr_np[:, i].max(), X_te_np[:, i].max()) + 1)
-            for i in cat_idxs
-        ]
+        # Size the embedding tables from TRAINING rows only. Taking the max over the
+        # test slice too would let the test period set the table width -- a small leak,
+        # but the same class as the one this protocol exists to remove. Codes run
+        # 0..max_train, and index max_train+1 is a dedicated UNK slot that every level
+        # first seen after the cutoff maps to.
+        _tr_max = [int(Xtr_np[:, i].max()) for i in cat_idxs]
+        cat_dims = [m + 2 for m in _tr_max]
+
+        def _clip_unseen(A):
+            """Map post-cutoff levels onto the trained UNK index."""
+            if A is None:
+                return None
+            A = A.copy()
+            for i, m in zip(cat_idxs, _tr_max):
+                np.clip(A[:, i], 0, m + 1, out=A[:, i])
+                A[A[:, i] > m, i] = m + 1
+            return A
+
+        _n_unseen = sum(int((X_te_np[:, i] > m).sum()) for i, m in zip(cat_idxs, _tr_max))
+        if _n_unseen:
+            print(f"    [TabNet] {_n_unseen:,} test cells hold a level unseen in "
+                  f"training; mapped to UNK", flush=True)
+        X_te_np = _clip_unseen(X_te_np)
+        X_trs_np = _clip_unseen(X_trs_np)
 
     eval_size = min(50000, len(X_te_np))
     # eval_set drives TabNet's own early stopping (patience=3), so it must not be the
     # test slice -- that would select the model on the data it is reported against.
-    _val_X, _val_i = ((X_trs_np, np.asarray(trs)) if X_trs_np is not None
-                      else (X_te_np, np.asarray(tei)))
+    if X_trs_np is None:
+        # Falling back to the test slice here would select the epoch on the data the
+        # model is then reported against -- the exact leak this protocol exists to
+        # prevent. Fail loudly instead of doing it silently.
+        raise ValueError(
+            "no validation holdout: pass trs=. Validating on the test slice would "
+            "select the model on the data it is scored against.")
+    _val_X, _val_i = X_trs_np, np.asarray(trs)
     eval_size = min(eval_size, len(_val_X))
     eval_idx = np.random.choice(len(_val_X), size=eval_size, replace=False)
     X_eval_sub = _val_X[eval_idx]
     y_eval_sub = ya[_val_i][eval_idx]
 
     y_tr = ya[tri]
+    assert len(Xtr_np) == len(y_tr), (
+        f"feature/label mismatch: {len(Xtr_np):,} rows of X against {len(y_tr):,} "
+        f"labels. pytorch_tabnet does not check this and will train on misaligned rows.")
 
     # TabNetRegressor requires 2D targets shape (N, 1)
     if kind == "reg":
@@ -63,14 +113,11 @@ def tabnet_fit_eval(
         cat_idxs=cat_idxs,
         cat_dims=cat_dims,
         optimizer_fn=torch.optim.Adam,
+        # lr 0.02 with the scheduler stepping every 5 epochs
         optimizer_params=dict(lr=2e-2),
         scheduler_params={"step_size": 5, "gamma": 0.9},
         scheduler_fn=torch.optim.lr_scheduler.StepLR,
         mask_type="sparsemax",
-        # pytorch_tabnet's TabModel declares `seed: int = 0` and calls
-        # torch.manual_seed(self.seed) in its own constructor, AFTER the harness has
-        # called set_global_seed(). Leaving this out meant every seed trained from 0
-        # and the three runs came back bit-identical, so the spread was exactly 0.
         seed=seed,
         verbose=1,
     )
@@ -91,17 +138,21 @@ def tabnet_fit_eval(
                       {f"train/{k}" if k == "loss" else f"val/{k}": v
                        for k, v in (logs or {}).items()
                        if isinstance(v, (int, float))},
-                      phase=f"tabnet[{kind}]")
+                      phase=None)
 
     clf.fit(
         X_train=Xtr_np,
         y_train=y_tr,
         eval_set=[(X_eval_sub, y_eval_sub)],
-        eval_name=["test"],
+        eval_name=["val"],
         eval_metric=eval_metric,
         callbacks=[_WandbEpoch()],
-        max_epochs=10,
-        patience=3,
+        max_epochs=NEURAL_EPOCHS,
+        # patience=0 skips pytorch_tabnet's EarlyStopping callback, which is what
+        # restores best weights. That is deliberate: the eval slice sits inside the
+        # training window (full_train_idx = tri_all), so restoring the best epoch
+        # would select on rows the model fitted. Fixed budget => final epoch.
+        patience=0,
         batch_size=16384,
         virtual_batch_size=2048,
         num_workers=0,
@@ -110,38 +161,6 @@ def tabnet_fit_eval(
         compute_importance=False,
     )
 
-    if refit_idx is not None:
-        # pytorch_tabnet drives its own early stopping from `eval_set`, so the epoch
-        # count is selected there. Refit from scratch on the FULL training window for
-        # exactly that many epochs with NO eval_set, so nothing can stop it early and
-        # the final fit sees every row the trees see. See docs/validation-protocol.md.
-        n_ep = int(getattr(clf, "best_epoch", 0) or 0) + 1
-        refit_idx = np.asarray(refit_idx)
-        print(f"    [TabNet] refit: {len(refit_idx):,} rows x {n_ep} epoch(s) "
-              f"(best_epoch={getattr(clf, 'best_epoch', None)} on the holdout)",
-              flush=True)
-        log_summary(selected_epoch=n_ep,
-                    final_fit_rows=int(len(refit_idx)))
-        X_rf = np.asarray(_get_slice(parts, refit_idx), dtype=np.float32)
-        y_rf = ya[refit_idx]
-        if kind == "reg":
-            y_rf = y_rf.reshape(-1, 1)
-        clf = (TabNetRegressor(**tabnet_params) if kind == "reg"
-               else TabNetClassifier(**tabnet_params))
-        clf.fit(
-            X_train=X_rf,
-            y_train=y_rf,
-            max_epochs=n_ep,
-            patience=0,                 # 0 disables early stopping in pytorch_tabnet
-            batch_size=16384,
-            virtual_batch_size=2048,
-            num_workers=0,
-            pin_memory=pin_mem,
-            drop_last=False,
-            compute_importance=False,
-        )
-        del X_rf, y_rf
-        gc.collect()
 
     save_path = model_path(exp_tag, "tabnet", kind, split)
     clf.save_model(save_path)

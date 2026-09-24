@@ -94,8 +94,14 @@ def tabr_fit_eval(
     # Validation for epoch selection must NOT be the test slice: the loop keeps the
     # best-scoring epoch, so validating on `tei` selects the model on the data it
     # is then reported against. `trs` is the harness's held-out slice.
-    _val_X, _val_i = ((X_trs_np, np.asarray(trs)) if X_trs_np is not None
-                      else (X_te_np, np.asarray(tei)))
+    if X_trs_np is None:
+        # Falling back to the test slice here would select the epoch on the data the
+        # model is then reported against -- the exact leak this protocol exists to
+        # prevent. Fail loudly instead of doing it silently.
+        raise ValueError(
+            "no validation holdout: pass trs=. Validating on the test slice would "
+            "select the model on the data it is scored against.")
+    _val_X, _val_i = X_trs_np, np.asarray(trs)
     eval_size = min(eval_size, len(_val_X))
     eval_idx = rng.choice(len(_val_X), size=eval_size, replace=False)
     X_eval_tensor = torch.tensor(_val_X[eval_idx]).to(DEV)
@@ -144,7 +150,7 @@ def tabr_fit_eval(
         log_epoch(epoch + 1,
                   {"train/loss": avg_loss, "val/auc": val_auc,
                    "val/best_auc": max(best_auc, val_auc)},
-                  phase=f"tabr[{kind}]")
+                  phase=None)
         if val_auc > best_auc:
             best_auc = val_auc
             patience_counter = 0

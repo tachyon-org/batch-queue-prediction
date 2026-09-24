@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, r2_score, roc_auc_score
 from eval.helper import _empty_gpu, _get_slice
+from eval.helper import NEURAL_EPOCHS, NEURAL_CAT
 from eval.wandb_logger import log_epoch, log_summary
 from eval.paths import model_path
 
@@ -108,10 +109,14 @@ def saint_fit_eval(
     split=None,
     exp_tag=None,
     is_regression=False,
-    refit_idx=None,
+    full_train_idx=None,
 ):
     DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ya = np.asarray(y, dtype=np.float32)
+
+    # Fixed epoch budget: train once on the full window.
+    if full_train_idx is not None:
+        tri = np.asarray(full_train_idx)
 
     Xtr = _get_slice(parts, tri)
     X_te = _get_slice(parts, tei)
@@ -126,7 +131,11 @@ def saint_fit_eval(
     )
 
     n_features = Xtr_np.shape[1]
-    n_cat = ncat if isinstance(ncat, int) and ncat > 0 else 0
+    # NEURAL_CAT is off by default -- see eval/helper.py for the measured reason.
+    # n_cat must go to 0 as well, not just cat_dims: the model sizes its numeric
+    # branch as n_features - n_cat, so leaving n_cat set would build a model
+    # expecting fewer columns than the input actually has.
+    n_cat = (ncat if isinstance(ncat, int) and ncat > 0 else 0) if NEURAL_CAT else 0
     n_num = n_features - n_cat
 
     cat_dims = []
@@ -144,8 +153,7 @@ def saint_fit_eval(
     )
 
     def _build():
-        """Fresh model + optimizer. The refit trains from scratch rather than
-        continuing the selection model: only the epoch count carries over."""
+        """Fresh model + optimizer."""
         m = SAINT(
             n_num=n_num,
             cat_dims=cat_dims,
@@ -183,8 +191,14 @@ def saint_fit_eval(
     # selecting the model on the data it is then reported against. `trs` is the
     # harness's held-out slice (a genuine holdout for E1/E3; a training subsample
     # for E2, where it makes early stopping inert rather than leaky).
-    _val_X, _val_i = ((X_trs_np, np.asarray(trs)) if X_trs_np is not None
-                      else (X_te_np, np.asarray(tei)))
+    if X_trs_np is None:
+        # Falling back to the test slice here would select the epoch on the data the
+        # model is then reported against -- the exact leak this protocol exists to
+        # prevent. Fail loudly instead of doing it silently.
+        raise ValueError(
+            "no validation holdout: pass trs=. Validating on the test slice would "
+            "select the model on the data it is scored against.")
+    _val_X, _val_i = X_trs_np, np.asarray(trs)
     eval_size = min(30000, len(_val_X))
     eval_idx = np.random.choice(len(_val_X), size=eval_size, replace=False)
     X_eval_tensor = torch.from_numpy(_val_X[eval_idx]).to(
@@ -194,9 +208,11 @@ def saint_fit_eval(
 
     best_score = -float("inf")
     best_epoch = 0
-    patience, patience_counter, best_weights = 5, 0, None
+    # Early stopping disabled: the budget is fixed, so no epoch is chosen
+    # from data. The holdout score is still printed, but nothing acts on it.
+    patience, patience_counter, best_weights = NEURAL_EPOCHS + 1, 0, None
 
-    for epoch in range(10):
+    for epoch in range(NEURAL_EPOCHS):
         model.train()
         running_loss = 0.0
         for bx, by in loader_tr:
@@ -234,13 +250,13 @@ def saint_fit_eval(
                 metric_name = "Val AUC"
 
         print(
-            f"    [SAINT] Epoch {epoch+1:02d}/10 | Loss: {avg_loss:.4f} | {metric_name}: {val_score:.5f} (Best: {max(best_score, val_score):.5f})",
+            f"    [SAINT] Epoch {epoch+1:02d}/{NEURAL_EPOCHS} | Loss: {avg_loss:.4f} | {metric_name}: {val_score:.5f} (Best: {max(best_score, val_score):.5f})",
             flush=True,
         )
         log_epoch(epoch + 1,
                   {"train/loss": avg_loss, "val/score": val_score,
                    "val/best_score": max(best_score, val_score)},
-                  phase=f"saint[{kind}]")
+                  phase=None)
 
         if val_score > best_score:
             best_score = val_score
@@ -255,57 +271,12 @@ def saint_fit_eval(
     save_path = model_path(exp_tag, "saint", kind, split, ".pt")
     torch.save(model.state_dict(), save_path)
 
-    if best_weights is not None:
-        model.load_state_dict(best_weights)
+    # Fixed budget, and the monitor slice lives inside the training window
+    # (full_train_idx = tri_all), so restoring the best epoch would select on
+    # rows the model fitted. Keep the final epoch; best_weights is tracked for
+    # logging only.
+    _ = best_weights
 
-    if refit_idx is not None and best_epoch > 0:
-        # Selection is done and its model is discarded. Retrain from scratch on the
-        # FULL training window for exactly the epoch count the holdout chose, with no
-        # validation and no early stopping, so the final fit sees every row the trees
-        # see. See docs/validation-protocol.md.
-        refit_idx = np.asarray(refit_idx)
-        print(f"    [SAINT] refit: {{len(refit_idx):,}} rows x {{best_epoch}} epoch(s) "
-              f"(selected on {{len(_val_i):,}} holdout rows, best {{best_score:.5f}})",
-              flush=True)
-        # Rebound rather than deleted: the cleanup at the end of this function still
-        # names them, and `del` here would make that a NameError on the refit path.
-        ds_tr = loader_tr = Xtr_np = None
-        gc.collect()
-
-        X_rf = np.ascontiguousarray(
-            np.asarray(_get_slice(parts, refit_idx), dtype=np.float32))
-        loader_rf = DataLoader(
-            TensorDataset(torch.from_numpy(X_rf), torch.from_numpy(ya[refit_idx])),
-            batch_size=16384, shuffle=True, drop_last=False,
-            pin_memory=use_amp, num_workers=0,
-        )
-        log_summary(selected_epoch=best_epoch,
-                    selection_score=float(best_score),
-                    holdout_rows=int(len(_val_i)),
-                    final_fit_rows=int(len(refit_idx)))
-        model, optimizer = _build()
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-        for epoch in range(best_epoch):
-            running_loss = 0.0
-            model.train()
-            for bx, by in loader_rf:
-                bx = bx.to(DEV, non_blocking=True)
-                by = by.to(DEV, non_blocking=True)
-                optimizer.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    loss = criterion(model(bx), by)
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                running_loss += loss.item()
-            avg = running_loss / len(loader_rf)
-            print(f"    [SAINT] refit epoch {{epoch+1:02d}}/{{best_epoch}} | "
-                  f"Loss: {{avg:.4f}}", flush=True)
-            log_epoch(epoch + 1, {{"refit/loss": avg}}, phase="saint-e2-refit")
-        del loader_rf, X_rf
-        gc.collect()
 
 
     model.eval()

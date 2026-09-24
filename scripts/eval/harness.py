@@ -129,7 +129,7 @@ def save_experiment_results(exp_name, lib, got_metrics, output_dir=None):
 def fit_eval_binary(
     lib, parts, tri, tei, trs, yv, spw, want_imp=False, ncat=None, split=None, exp_tag=None,
     class_names=None, eval_mask=None, seed=DEFAULT_SEED, save_preds=True,
-    calibrate="isotonic", thr_external=None,
+    calibrate="isotonic", thr_external=None, oot=None, oot_mask=None, cat_idx=None,
 ):
     """Fits the requested binary model library and returns metrics, importance, and CM.
 
@@ -142,6 +142,16 @@ def fit_eval_binary(
     score every test job -- which the cascade needs -- while reporting its own
     conditional metrics on the failed subset only.
 
+    `oot` is the shared out-of-time slice, appended to `tei` so every library scores it
+    in the same pass. `mm` then carries the protocol test metrics and `mm["oot"]` the
+    out-of-time ones, both at the SAME operating point -- a threshold is part of what
+    gets deployed, so re-tuning it on the future period would answer a different
+    question. `oot_mask` is the E3-style row filter for that slice.
+
+    `cat_idx` names the code columns to treat as categorical, decided once in __main__
+    from pre-cutoff rows so the two protocol arms cannot disagree about a column near
+    the cardinality threshold.
+
     `thr_external` carries an operating point selected under a DIFFERENT protocol,
     as {'thr': float, 'thr_neg': float|None, 'source': str}. When given, the model
     is scored a second time at that cut and the result is stored under mm['transfer'].
@@ -152,6 +162,13 @@ def fit_eval_binary(
     yva = np.asarray(yv)
     nfeat = _nfeat(parts)
     imp = None
+
+    # Scored in the same pass as the protocol test set: appending keeps every library
+    # on one predict() call and guarantees both arms see identical rows.
+    _oot = np.asarray(oot) if oot is not None and len(oot) else None
+    _n_te = len(tei)
+    if _oot is not None:
+        tei = np.concatenate([np.asarray(tei), _oot])
 
     if lib == "mlp":
         p_te, p_trs = mlp_fit_eval(
@@ -186,7 +203,7 @@ def fit_eval_binary(
 
     elif lib == "xgboost":
         Xtr = _get_slice(parts, tri)
-        m = _xgb_cls(spw, seed)
+        m = _xgb_cls(spw, seed, ncat=ncat or 0, nfeat=nfeat, cat_idx=cat_idx)
         m.fit(Xtr, yva[tri])
 
         X_trs = _xgb_prep(_get_slice(parts, trs))
@@ -211,9 +228,10 @@ def fit_eval_binary(
 
     else:
         Xtr = _get_slice(parts, tri)
-        m = _sk_fit(_sk_cls(lib, spw, seed), Xtr, yva[tri])
-        p_trs = m.predict_proba(_get_slice(parts, trs))[:, 1]
-        p_te = m.predict_proba(_get_slice(parts, tei))[:, 1]
+        m = _sk_fit(_sk_cls(lib, spw, seed, ncat=ncat or 0, cat_idx=cat_idx),
+                    Xtr, yva[tri], ncat=ncat or 0, cat_idx=cat_idx)
+        p_trs = _sk_predict(m, _get_slice(parts, trs), ncat=ncat or 0, cat_idx=cat_idx)
+        p_te = _sk_predict(m, _get_slice(parts, tei), ncat=ncat or 0, cat_idx=cat_idx)
         if want_imp:
             imp = sk_gain(m, nfeat)
 
@@ -249,18 +267,30 @@ def fit_eval_binary(
     # reporting all read these back rather than reloading a model and re-running
     # inference.
     if save_preds and exp_tag is not None and split is not None:
-        save_predictions(exp_tag, lib, split, np.asarray(tei), p_te, seed=seed,
-                         probs_cal=np.asarray(p_te_cal, dtype=np.float32))
+        # The two arms are saved separately. Writing them concatenated would leave the
+        # cascade composing scores from the protocol test period and the later
+        # out-of-time window as one population, with nothing marking the boundary.
+        _tei_a = np.asarray(tei)
+        _pc = np.asarray(p_te_cal, dtype=np.float32)
+        save_predictions(exp_tag, lib, split, _tei_a[:_n_te], p_te[:_n_te], seed=seed,
+                         probs_cal=_pc[:_n_te])
+        if _oot is not None:
+            save_predictions(exp_tag, lib, f"{split}__oot", _tei_a[_n_te:],
+                             p_te[_n_te:], seed=seed, probs_cal=_pc[_n_te:])
 
+    _tei_p = np.asarray(tei)[:_n_te]
     m_idx = slice(None) if eval_mask is None else np.asarray(eval_mask, dtype=bool)
-    y_eval, p_eval = yva[tei][m_idx], p_te[m_idx]
+    y_eval, p_eval = yva[_tei_p][m_idx], p_te[:_n_te][m_idx]
 
     # Score calibration on the population the stage is DEFINED over, not on every row
     # it happened to score. E3 estimates P(hardware | failure) and is calibrated on a
     # failures-only slice, so judging it against the unconditional base rate over all
     # test jobs would report a correctly calibrated stage as badly miscalibrated.
     if calibrate and p_te_cal is not p_te:
-        cal_report = calibration_report(y_eval, p_eval, np.asarray(p_te_cal)[m_idx])
+        # p_te_cal spans tei + oot; the report describes the protocol arm, so it is
+        # restricted to the first _n_te rows before the eval mask is applied.
+        cal_report = calibration_report(
+            y_eval, p_eval, np.asarray(p_te_cal)[:_n_te][m_idx])
         print(f"[{lib}] calibration ({calibrate}): Brier "
               f"{cal_report['brier_raw']:.5f} -> {cal_report['brier_cal']:.5f} | ECE "
               f"{cal_report['ece_raw']:.4f} -> {cal_report['ece_cal']:.4f} | mean pred "
@@ -290,6 +320,20 @@ def fit_eval_binary(
             mm["threshold_neg_calibrated"] = float(np.asarray(_cal(np.array([thr_neg])))[0])
             mm[class_names[0]]["threshold_calibrated"] = mm["threshold_calibrated"]
             mm[class_names[1]]["threshold_calibrated"] = mm["threshold_neg_calibrated"]
+    if _oot is not None:
+        om = slice(None) if oot_mask is None else np.asarray(oot_mask, dtype=bool)
+        y_o, p_o = yva[_oot][om], p_te[_n_te:][om]
+        if len(y_o) and len(np.unique(y_o)) > 1:
+            if class_names is not None:
+                mm["oot"] = cls_metrics_per_class(
+                    y_o, p_o, thr, thr_neg=thr_neg,
+                    pos_name=class_names[0], neg_name=class_names[1])
+            else:
+                mm["oot"] = cls_metrics(y_o, p_o, thr)
+        else:
+            print(f"    [{lib}] oot slice has <2 classes after masking; skipped",
+                  flush=True)
+
     if thr_external is not None:
         # Deployment simulation: an operating point fixed under one protocol and
         # carried into another without re-calibration. Scored on the same raw scores
@@ -320,7 +364,7 @@ def fit_eval_binary(
 
 def fit_eval_reg(
     lib, parts, tri, tei, trs, yv, want_imp=False, ncat=None, split=None,
-    exp_tag=None, seed=DEFAULT_SEED, refit_idx=None,
+    exp_tag=None, seed=DEFAULT_SEED, full_train_idx=None,
     oot=None, cat_idx=None,
 ):
     """Fits the requested regression model library and returns wait time regression metrics and importance.
@@ -337,15 +381,14 @@ def fit_eval_reg(
 
     `seed` must be threaded through: the neural trainers draw init and shuffling from
     the global RNGs, and the tree regressors subsample rows and columns, so without it
-    every seed refits the identical model and the spread across seeds is exactly 0.
+    every seed fits the identical model and the spread across seeds is exactly 0.
 
-    `refit_idx` is the FULL training window. Models that select an epoch count on the
-    validation holdout use `tri`/`trs` for that, then refit on `refit_idx`; models with
-    nothing to select (the boosted trees) skip selection
-    and fit on `refit_idx` directly. Both paths end with every model's final fit seeing
-    the same rows, which is what makes the cross-model comparison mean anything --
-    holding the most recent 10% out of the final fit cost XGBoost 0.13 R2_log on the
-    temporal split despite it having no epoch to select. See docs/validation-protocol.md.
+    `full_train_idx` is the full training window, and every model fits on exactly it in
+    one pass: the neural trainers run a fixed epoch budget and the trees have nothing to
+    select, so neither needs a second pass. That shared fit set is what makes the
+    cross-model comparison mean anything -- holding the most recent 10% out of the final
+    fit cost XGBoost 0.13 R2_log on the temporal split despite it having no epoch to
+    select. See docs/validation-protocol.md.
     """
     tei = np.asarray(tei)
     _oot = np.asarray(oot) if oot is not None and len(oot) else None
@@ -354,7 +397,7 @@ def fit_eval_reg(
         tei = np.concatenate([tei, _oot])
 
     # Models with no selection step fit here; the holdout would only take data away.
-    _fit_i = tri if refit_idx is None else np.asarray(refit_idx)
+    _fit_i = tri if full_train_idx is None else np.asarray(full_train_idx)
     set_global_seed(seed)
     yva = np.asarray(yv)
     nfeat = _nfeat(parts)
@@ -368,19 +411,19 @@ def fit_eval_reg(
     elif lib == "tabnet":
         p_te, p_trs, imp = tabnet_fit_eval(
             parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
-            exp_tag=exp_tag, seed=seed, refit_idx=refit_idx
+            exp_tag=exp_tag, seed=seed, full_train_idx=full_train_idx
         )
 
     elif lib == "saint":
         p_te, p_trs, imp = saint_fit_eval(
             parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
-            exp_tag=exp_tag, is_regression=True, refit_idx=refit_idx
+            exp_tag=exp_tag, is_regression=True, full_train_idx=full_train_idx
         )
 
     elif lib == "ft":
         p_te, p_trs, imp = ft_fit_eval(
             parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
-            exp_tag=exp_tag, is_regression=True, refit_idx=refit_idx
+            exp_tag=exp_tag, is_regression=True, full_train_idx=full_train_idx
         )
 
     elif lib == "tabr":
@@ -391,13 +434,13 @@ def fit_eval_reg(
     elif lib == "tsmixer":
         p_te, p_trs, imp = tsmixer_fit_eval(
             parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
-            exp_tag=exp_tag, is_regression=True, refit_idx=refit_idx
+            exp_tag=exp_tag, is_regression=True, full_train_idx=full_train_idx
         )
 
     elif lib == "hierarchical":
         p_te, p_trs, imp = hierarchical_fit_eval(
             parts, tri, tei, ncat, "reg", yv, trs=trs, want_imp=want_imp, split=split,
-            exp_tag=exp_tag, seed=seed, refit_idx=refit_idx
+            exp_tag=exp_tag, seed=seed, full_train_idx=full_train_idx
         )
 
     elif lib in ("xgboost", "xgb"):
@@ -468,7 +511,8 @@ def _random_first(splits):
     return sorted(splits, key=lambda s: {"random": 0, "temporal": 1}.get(s[0], 2))
 
 
-def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None, seed=DEFAULT_SEED):
+def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None,
+                 seed=DEFAULT_SEED, oot=None, cat_idx=None):
     """Executes evaluation across all splits for a given model architecture.
 
     `order` is the per-row time key used to carve the threshold-selection slice off
@@ -504,6 +548,8 @@ def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None, see
                 exp_tag="e1",
                 seed=seed,
                 thr_external=(thr_random if split == "temporal" else None),
+                oot=oot,
+                cat_idx=cat_idx,
             )
             if split == "random":
                 thr_random = {"thr": mm["threshold"], "source": "random-split holdout"}
@@ -575,10 +621,15 @@ def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None,
                 tri_all, order=order if split == "temporal" else None)
             tri = fit_i
             trs = thr_sample(val_i)
-            print(f"[{lib}/{split}] fit {len(fit_i):,} | validation holdout "
-                  f"{len(val_i):,} ({len(val_i) / len(tri_all):.0%}"
-                  f"{', most recent' if order is not None and split == 'temporal' else ', random'})",
-                  flush=True)
+            # Report what is actually fitted. `full_train_idx=tri_all` below means the
+            # final fit uses the WHOLE window, so `val_i` is not held out of it -- the
+            # neural trainers monitor and restore best weights on rows they trained on.
+            # Printing len(fit_i) here implied a disjoint holdout that does not exist,
+            # which is what let a feature/label misalignment in tabnet.py go unnoticed.
+            print(f"[{lib}/{split}] fit {len(tri_all):,} (full window) | "
+                  f"monitor slice {len(trs):,} ({len(trs) / len(tri_all):.0%}"
+                  f"{', most recent' if order is not None and split == 'temporal' else ', random'}"
+                  f", IN-SAMPLE)", flush=True)
 
             t_start = time.perf_counter()
             mm, imp, _ = fit_eval_reg(
@@ -594,7 +645,7 @@ def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None,
                 split=split,
                 exp_tag="e2",
                 seed=seed,
-                refit_idx=tri_all,
+                full_train_idx=tri_all,
                 oot=oot_v,
             )
             if imp is not None:
@@ -684,7 +735,8 @@ def _fmt_e3_delta(lib, rnd, tmp):
     return "\n".join(lines)
 
 
-def run_e3_model(lib, Xm, failed, hw, splits, imp_store, cm_store, ncat, order=None, seed=DEFAULT_SEED):
+def run_e3_model(lib, Xm, failed, hw, splits, imp_store, cm_store, ncat,
+                 order=None, seed=DEFAULT_SEED, oot=None, cat_idx=None):
     """Executes fault attribution evaluation (hardware vs. payload failure) conditioned on job failure.
 
     `order` is the per-row time key used to carve the threshold-selection slice off
@@ -742,6 +794,9 @@ def run_e3_model(lib, Xm, failed, hw, splits, imp_store, cm_store, ncat, order=N
                 eval_mask=eval_mask,
                 seed=seed,
                 thr_external=(thr_random if split == "temporal" else None),
+                oot=oot,
+                oot_mask=(failed_a[np.asarray(oot)] == 1) if oot is not None and len(oot) else None,
+                cat_idx=cat_idx,
             )
             if split == "random":
                 # Both cuts travel: E3 tunes hardware and payload separately.
@@ -789,9 +844,6 @@ def run_cascade(e1_lib, e3_lib, split, failed, hw, seed=DEFAULT_SEED,
     Chaining the two stages, P(hardware) = P(failure) * P(hardware | failure),
     restores a prediction over the whole test population, which is the form a
     deployed alert would actually take.
-
-    Reads both stages from their saved prediction files rather than refitting, so
-    this is cheap to re-run and any (E1, E3) pairing can be scored.
     """
     idx1, p_fail = load_predictions("e1", e1_lib, split, seed=seed)
     idx3, p_attr = load_predictions("e3_fault", e3_lib, split, seed=seed)
@@ -966,6 +1018,19 @@ if __name__ == "__main__":
     if RAN is None:
         print("[warn] ran.npy not found -- every row is treated as a valid target. "
               "Re-run the feature pipeline to regenerate it.", flush=True)
+
+    # GlideinWMS pilots are infrastructure, not workflow jobs: no pilot carries a
+    # matched site, so every MATCH_* attribute is null for them -- and null match
+    # attributes are an outcome-correlated missingness signal (49.9% failure against
+    # 17.9% populated), which is exactly what the leakage audit scopes the match tasks
+    # away from. A pilot also has no payload for E3 to attribute a fault to. E2 is
+    # unaffected: it is a submit-time task and keeps its own population.
+    _pilot_path = os.path.join(SAVE_DIR, "is_pilot.npy")
+    IS_PILOT = (np.load(_pilot_path, mmap_mode="r").astype(bool)
+                if os.path.exists(_pilot_path) else None)
+    if IS_PILOT is None and args.experiment in ("e1", "e3"):
+        print("[warn] is_pilot.npy not found -- E1/E3 will include GlideinWMS pilots, "
+              "whose match attributes are null by construction.", flush=True)
     # targets_and_masks.npz is what the feature pipeline writes now; the standalone
     # wait_sv.npy is a leftover it no longer updates, so reading that first would
     # silently pair fresh features with a stale target.
@@ -1055,12 +1120,24 @@ if __name__ == "__main__":
         SPLITS.append(("temporal", *_sp["temporal"]))
 
     if RAN is not None and args.experiment in ("e1", "e3"):
+        # One mask for both, and it must reach OOT too -- that slice is scored by the
+        # same models, so leaving it unfiltered would evaluate them on a population
+        # they were never trained for.
+        _keep = RAN if IS_PILOT is None else (RAN & ~IS_PILOT)
         _before = sum(len(a) + len(b) for _, a, b in SPLITS)
-        SPLITS = [(nm, a[RAN[a]], b[RAN[b]]) for nm, a, b in SPLITS]
+        SPLITS = [(nm, a[_keep[a]], b[_keep[b]]) for nm, a, b in SPLITS]
         _after = sum(len(a) + len(b) for _, a, b in SPLITS)
-        print(f"Target mask (Ran): {_before - _after:,} never-ran rows removed from the "
-              f"{args.experiment.upper()} population; they remain in the feature matrices "
-              f"as queue context.", flush=True)
+        _n_pilot = 0 if IS_PILOT is None else int((RAN & IS_PILOT).sum())
+        print(f"Target mask (Ran{'' if IS_PILOT is None else ' & not pilot'}): "
+              f"{_before - _after:,} rows removed from the "
+              f"{args.experiment.upper()} population"
+              + ("" if IS_PILOT is None else f" ({_n_pilot:,} of them pilots)")
+              + "; they remain in the feature matrices as queue context.", flush=True)
+        if OOT is not None and len(OOT):
+            _o0 = len(OOT)
+            OOT = np.asarray(OOT)[_keep[np.asarray(OOT)]]
+            print(f"  out-of-time slice: {_o0:,} -> {len(OOT):,} after the same mask",
+                  flush=True)
 
     IMP = {}
     for nm, a, b in SPLITS:
@@ -1100,7 +1177,8 @@ if __name__ == "__main__":
         _got = {}
         for sd in SEEDS:
             _got.update(run_e1_model(
-                args.model, Xmatch, failed, SPLITS, IMP, CM, NCAT_MATCH, order=QS, seed=sd
+                args.model, Xmatch, failed, SPLITS, IMP, CM, NCAT_MATCH, order=QS,
+                seed=sd, oot=OOT, cat_idx=CAT_IDX
             ) or {})
         report_seed_variance(_got, ["roc_auc", "pr_auc", "f1", "mcc"],
                              label=f" [e1/{args.model}]")
@@ -1136,7 +1214,7 @@ if __name__ == "__main__":
         for sd in SEEDS:
             _got.update(run_e3_model(
                 args.model, Xmatch, failed, hw, SPLITS, IMP, CM, NCAT_MATCH, order=QS,
-                seed=sd,
+                seed=sd, oot=OOT, cat_idx=CAT_IDX
             ) or {})
         report_seed_variance(
             _got, ["hardware.pr_auc", "hardware.f1", "payload.pr_auc", "mcc"],

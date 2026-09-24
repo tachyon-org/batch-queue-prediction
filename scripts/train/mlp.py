@@ -7,7 +7,8 @@ from eval.helper import _empty_gpu, _get_slice, _nfeat
 from eval.wandb_logger import log_epoch
 from eval.paths import model_path
 
-MLP_EPOCHS, MLP_BS, MLP_LR, MLP_EMB_CAP = 2, 16384, 1e-3, 32
+from eval.helper import NEURAL_EPOCHS, NEURAL_CAT
+MLP_EPOCHS, MLP_BS, MLP_LR, MLP_EMB_CAP = NEURAL_EPOCHS, 16384, 1e-3, 32
 
 class MLP(nn.Module):
     """Standard Feedforward Neural Network (MLP) with Categorical Embeddings."""
@@ -67,7 +68,9 @@ def mlp_fit_eval(
     Xtr = _get_slice(parts, tri)
 
     # Determine categorical vs numerical dimensions
-    n_cat_cols = ncat if isinstance(ncat, int) else 0
+    # NEURAL_CAT is off by default: embedding the code columns memorises entity
+    # identity that does not survive the cutoff. See eval/helper.py.
+    n_cat_cols = (ncat if isinstance(ncat, int) else 0) if NEURAL_CAT else 0
     cards_f = (
         [int(Xtr[:, i].max() + 1) for i in range(n_cat_cols)]
         if n_cat_cols > 0
@@ -156,7 +159,7 @@ def mlp_fit_eval(
         )
         # Per-epoch curve for W&B. No-op unless a run is active, so this stays
         # runnable with wandb absent.
-        log_epoch(ep + 1, {"train/loss": tot / max(nb_, 1)}, phase=f"mlp[{kind}]")
+        log_epoch(ep + 1, {"train/loss": tot / max(nb_, 1)}, phase=None)
 
     if split is not None:
         save_path = model_path(exp_tag, "mlp", kind, split, ".pt")
