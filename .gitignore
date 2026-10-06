@@ -3,14 +3,12 @@
 *.png
 data/
 .DS_Store
-models/
-old/
-dr_app/
+results/
+output/
 docs/
 __pycache__/
 .ipynb_checkpoints/
 catboost_info/
-paper/
 
 # W&B: filled-in config (credentials) and run scratch; the .example is committed.
 scripts/config/wandb.yaml

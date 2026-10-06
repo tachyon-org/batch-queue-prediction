@@ -1,9 +1,0 @@
-# Defaults for the interactive DR data explorer (vis/app.py: build_explorer).
-defaults:
-  start_date: 2025-03-01   # first month of the dataset
-  end_date: 2025-03-31     
-  dr_method: UMAP
-  entity: Campaigns
-  n_neighbors: 15          # UMAP only
-  perplexity: 30           # t-SNE only
-

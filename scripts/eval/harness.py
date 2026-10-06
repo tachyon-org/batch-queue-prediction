@@ -19,7 +19,7 @@ from eval.helper import (
     aggregate_seeds,
 )
 from eval.paths import DATA_ROOT, RESULTS_DIR, model_path
-from eval.splits import build_splits
+from eval.splits import build_splits, validation_split, val_start_date, SPLIT_DESIGN
 from eval.wandb_logger import WandbRun, load_config, config_summary
 from train.tree import (_xgb_reg, _sk_reg, _xgb_cls, _xgb_prep, sk_gain, _sk_cls,
                         _sk_predict, _cat_idx, CAT_MAX_LEVELS,
@@ -177,7 +177,8 @@ def fit_eval_binary(
 
     elif lib == "tabnet":
         p_te, p_trs, imp = tabnet_fit_eval(
-            parts, tri, tei, ncat, "bin", yv, spw=spw, trs=trs, want_imp=want_imp, split=split, exp_tag=exp_tag
+            parts, tri, tei, ncat, "bin", yv, spw=spw, trs=trs, want_imp=want_imp, split=split,
+            exp_tag=exp_tag, seed=seed
         )
 
     elif lib == "saint":
@@ -511,7 +512,7 @@ def _random_first(splits):
     return sorted(splits, key=lambda s: {"random": 0, "temporal": 1}.get(s[0], 2))
 
 
-def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None,
+def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None, val_start=None,
                  seed=DEFAULT_SEED, oot=None, cat_idx=None):
     """Executes evaluation across all splits for a given model architecture.
 
@@ -524,7 +525,10 @@ def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None,
     for split, a, b in _random_first(splits):
         wb = _wb_start("e1", lib, split, seed, n_train=int(len(a)), n_test=int(len(b)))
         try:
-            fit_i, val_i = holdout_split(a, order=order if split == "temporal" else None)
+            # 8020: date-based validation (validation_split); older designs: holdout_split.
+            fit_i, val_i = (validation_split(a, split, order, val_start)
+                            if val_start is not None else
+                            holdout_split(a, order=order if split == "temporal" else None))
             trs = thr_sample(val_i)
             spw = float((yva[fit_i] == 0).sum() / max((yva[fit_i] == 1).sum(), 1))
             print(
@@ -591,7 +595,7 @@ def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None,
     return got
 
 
-def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None,
+def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None, val_start=None,
                  seed=DEFAULT_SEED, oot=None, cat_idx=None):
     """Executes submit-time wait regression across requested splits for a given model architecture.
 
@@ -617,19 +621,19 @@ def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None,
             # of the training rows themselves, so a neural trainer validating on it
             # was validating on data it had fit -- early stopping could not see
             # overfitting at all. Fit on fit_i, validate on a slice held out of it.
-            fit_i, val_i = holdout_split(
-                tri_all, order=order if split == "temporal" else None)
+            fit_i, val_i = (validation_split(tri_all, split, order, val_start)
+                            if val_start is not None else
+                            holdout_split(tri_all, order=order if split == "temporal" else None))
             tri = fit_i
             trs = thr_sample(val_i)
-            # Report what is actually fitted. `full_train_idx=tri_all` below means the
-            # final fit uses the WHOLE window, so `val_i` is not held out of it -- the
-            # neural trainers monitor and restore best weights on rows they trained on.
-            # Printing len(fit_i) here implied a disjoint holdout that does not exist,
-            # which is what let a feature/label misalignment in tabnet.py go unnoticed.
-            print(f"[{lib}/{split}] fit {len(tri_all):,} (full window) | "
-                  f"monitor slice {len(trs):,} ({len(trs) / len(tri_all):.0%}"
+            # Fit on fit_i only, as E1/E3 do: no refit on the whole window. Under the
+            # matched-window split both arms share `tri_all`, so a refit gave them the
+            # same final model; holding out a different 10% (random vs most recent) is
+            # what keeps the two protocols distinct.
+            print(f"[{lib}/{split}] fit {len(fit_i):,} | validation holdout "
+                  f"{len(val_i):,} ({len(val_i) / len(tri_all):.0%}"
                   f"{', most recent' if order is not None and split == 'temporal' else ', random'}"
-                  f", IN-SAMPLE)", flush=True)
+                  f", excluded from training)", flush=True)
 
             t_start = time.perf_counter()
             mm, imp, _ = fit_eval_reg(
@@ -645,7 +649,6 @@ def run_e2_model(lib, Xsub, wait_log, splits, imp_store, ncat, order=None,
                 split=split,
                 exp_tag="e2",
                 seed=seed,
-                full_train_idx=tri_all,
                 oot=oot_v,
             )
             if imp is not None:
@@ -736,7 +739,7 @@ def _fmt_e3_delta(lib, rnd, tmp):
 
 
 def run_e3_model(lib, Xm, failed, hw, splits, imp_store, cm_store, ncat,
-                 order=None, seed=DEFAULT_SEED, oot=None, cat_idx=None):
+                 order=None, val_start=None, seed=DEFAULT_SEED, oot=None, cat_idx=None):
     """Executes fault attribution evaluation (hardware vs. payload failure) conditioned on job failure.
 
     `order` is the per-row time key used to carve the threshold-selection slice off
@@ -765,7 +768,9 @@ def run_e3_model(lib, Xm, failed, hw, splits, imp_store, cm_store, ncat,
 
             # Fit and threshold-selection rows must be disjoint, so the operating
             # point is chosen on predictions this model has not already seen.
-            fit_i, val_i = holdout_split(tri, order=order if split == "temporal" else None)
+            fit_i, val_i = (validation_split(tri, split, order, val_start)
+                            if val_start is not None else
+                            holdout_split(tri, order=order if split == "temporal" else None))
             trs = thr_sample(val_i)
             spw = float((hw_a[fit_i] == 0).sum() / max((hw_a[fit_i] == 1).sum(), 1))
             print(
@@ -938,7 +943,7 @@ if __name__ == "__main__":
              f"seeds to report the spread across them.",
     )
     parser.add_argument(
-        "--cutoff", type=str, default="2025-07-01",
+        "--cutoff", type=str, default="2025-07-10",
         help="Deployment cutoff for the temporal split: ISO date (UTC) or epoch "
              "seconds. Results are keyed by cutoff, so sweeps accumulate.",
     )
@@ -1056,7 +1061,7 @@ if __name__ == "__main__":
     NCAT_SUB = _SCHEMA.get("NCAT_SUB", globals().get("NCAT_SUB", None))
     print(f"ncat: match={NCAT_MATCH} sub={NCAT_SUB}", flush=True)
 
-    globals()["CUTOFF_TAG"] = None if args.cutoff == "2025-07-01" else CUTOFF_LABEL
+    globals()["CUTOFF_TAG"] = None if args.cutoff == "2025-07-10" else CUTOFF_LABEL
     WB_CFG.setdefault("tags", [])
     WB_CFG["tags"] = list(WB_CFG["tags"]) + [f"cut{CUTOFF_LABEL}"]
 
@@ -1096,8 +1101,28 @@ if __name__ == "__main__":
     # the same builder eval/dataset.py and feat-engineering.ipynb call. This used to be
     # a third, inline definition here (a whole-window permutation under a different
     # seed), so the sweeps ran a different split from everything else.
-    _sp = build_splits(tri_t, tei_t, order=tau, n_rows=len(QS))
+    _sp = build_splits(tri_t, tei_t, order=tau, n_rows=len(QS), qs=QS, cutoff=CUTOFF_EPOCH)
     OOT = _sp.pop("oot")
+
+    # 8020: the validation date V, computed once from the E1/E3 training rows and used
+    # by every experiment (experiment-setup.ipynb step 6), so E2 shares E1/E3's date.
+    VAL_START = None
+    if SPLIT_DESIGN == "8020":
+        _tau13 = tau if args.experiment != "e2" else terminal_time(
+            targets["comp"], job_start=targets["jst"],
+            wall_clock=targets["wall"] if "wall" in targets.files else None,
+            qdate=QS, floor=WINDOW_FLOOR)[0]
+        _tr13, _te13, _ = temporal_masks(QS, CUTOFF_EPOCH, label_time=_tau13, verbose=False)
+        _train13 = build_splits(np.where(_tr13)[0], np.where(_te13)[0], order=_tau13,
+                                n_rows=len(QS), qs=QS, cutoff=CUTOFF_EPOCH,
+                                verbose=False)["random"][0]
+        if RAN is not None:
+            _k13 = RAN if IS_PILOT is None else (RAN & ~IS_PILOT)
+            _train13 = _train13[_k13[_train13]]
+        VAL_START = val_start_date(QS, _train13)
+        print(f"Validation date V: {dt.datetime.fromtimestamp(VAL_START, dt.timezone.utc):%Y-%m-%d %H:%M} UTC "
+              f"(temporal arm validates on jobs submitted on/after it; the random arm on "
+              f"a random draw of the same size)", flush=True)
 
     # Which code columns get native categorical treatment, decided ONCE from
     # pre-cutoff rows. Deciding per arm would let a column near the cardinality
@@ -1178,6 +1203,7 @@ if __name__ == "__main__":
         for sd in SEEDS:
             _got.update(run_e1_model(
                 args.model, Xmatch, failed, SPLITS, IMP, CM, NCAT_MATCH, order=QS,
+                val_start=VAL_START,
                 seed=sd, oot=OOT, cat_idx=CAT_IDX
             ) or {})
         report_seed_variance(_got, ["roc_auc", "pr_auc", "f1", "mcc"],
@@ -1190,6 +1216,7 @@ if __name__ == "__main__":
         for sd in SEEDS:
             _got.update(run_e2_model(
                 args.model, Xsub, wait_log, SPLITS, IMP, NCAT_SUB, order=QS,
+                val_start=VAL_START,
                 seed=sd, oot=OOT, cat_idx=CAT_IDX
             ) or {})
         report_seed_variance(_got, ["r2_log", "within2x", "mae_log1p", "median_ae_s"],
@@ -1214,6 +1241,7 @@ if __name__ == "__main__":
         for sd in SEEDS:
             _got.update(run_e3_model(
                 args.model, Xmatch, failed, hw, SPLITS, IMP, CM, NCAT_MATCH, order=QS,
+                val_start=VAL_START,
                 seed=sd, oot=OOT, cat_idx=CAT_IDX
             ) or {})
         report_seed_variance(

@@ -28,32 +28,18 @@ fife-batch-jobs/
 │   ├── eval/
 │   │   ├── harness.py              		# Main CLI evaluation harness
 │   │   └── helper.py               		# Model loaders, metrics, and prediction routines
-│   ├── logs/                       		# Run logs from long-running sweeps (gitignored)
-│   ├── output/                     		# Figures (PDF) and per-run evaluation JSONs
-│   ├── results/                      		# Job prediction results (JSON format)
 │   ├── train/                      		# Model implementations
-│   ├── vis/								# Data explorer visualization
-|   ├── data-explorer.ipynb    				# Job data visualization app example (work in progress)
 |   ├── data-analysis.ipynb    				# Initial job data analysis, distribution fits
-|   ├── feat-engineering.ipynb 				# Training and testing setup for job prediction tasks
-|   ├── pred-analysis.ipynb    				# Job outcome prediction results
-|   ├── wait_time_regression.ipynb			# Queue wait time prediction results
-|   ├── load.py								# Module to load/process the job logs
+|   ├── data-processing.ipynb    			# Building feature matrices, targets, schema
+|   ├── experiment-setup.ipynb 				# Training and testing setup
+|   ├── load.py								# Module to load the job logs
 |   ├── run_sweep.sh						# Full sweep: all models x both splits x all tasks
-├── .gitignore                      		# Dataset and runtime configuration
+├── .gitignore                      	
 ├── CLAUDE.md                       		# Global instructions for Claude  
 ├── FIFE-Docs.md                    		# FIFE Batch Queue data documentation  
-├── MODELING.md                     		# Detailed modeling design notes
-├── README.md                       		# Repo info
+├── README.md                       	
 └── config.json								# Dataset and runtime configuration
 ```
-
-The notebooks live directly in `scripts/`, beside `eval/` and `train/`, rather than in
-a `notebooks/` subdirectory. Jupyter sets the working directory to the notebook's own
-folder, so this is what lets `from eval.dataset import load_experiment` resolve with no
-`sys.path` manipulation, and it makes the relative paths in the notebooks (`results/`,
-`output/`) the same ones the harness uses. Run them with `scripts/` as the working
-directory.
 
 ### Requirements
 
@@ -83,14 +69,7 @@ TBD
 
 ##### Structure
 
-Paths resolve through `scripts/eval/paths.py` and each root takes an environment
-override: `FIFE_DATA_ROOT` (feature matrices and targets, default fast local NVMe),
-`FIFE_MODEL_ROOT` (saved models, default bulk storage), `FIFE_PRED_ROOT` (saved test
-predictions). Data stays on scratch because training mmaps tens of GB out of it
-repeatedly; `/media/storage0` is NFS and would be far slower.
-
-Saved models are laid out one directory per experiment and model, with the seed in
-the filename so seeds no longer overwrite each other:
+Saved models are laid out one directory per experiment and model, with the seed in the filename so seeds no longer overwrite each other:
 
 ```
 models/

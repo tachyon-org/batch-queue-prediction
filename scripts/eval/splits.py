@@ -3,27 +3,51 @@
 `eval/dataset.py` and `feat-engineering.ipynb` both call `build_splits`, so the
 notebook that writes the matrices and the loader that reads them cannot disagree.
 
-The window is divided by label-observation time into three parts:
+"8020" (the default since 2026-10-06; prototyped step by step in
+experiment-setup.ipynb, section B):
 
-    pre-cutoff        everything before the cutoff                  (Feb - Jun)
-    protocol period   post-cutoff, before the out-of-time slice     (July)
+    cutoff       a fixed UTC midnight (--cutoff, default 2025-07-10): the midnight
+                 nearest the point where 80% of E1/E3 labels have been observed
+    window       every job whose label is observed before the cutoff
+    test (OOT)   every job observed after it, MINUS straddlers: jobs queued before
+                 the cutoff are purged (their prediction would have been made before
+                 it, by a model that could not see the last pre-cutoff outcomes)
+    R            a random RANDOM_TEST_FRACTION of the window, drawn over all rows so a
+                 job is on the same side in every experiment
+
+    random      train = window minus R     test = R, and the OOT test set
+    temporal    train = the same rows      test = the OOT test set
+
+Validation is carved out of the shared training rows by `validation_split`: the
+temporal arm validates on jobs SUBMITTED on or after a date V (`val_start_date`), and
+the random arm on a random draw of exactly as many jobs, so both arms fit and validate
+on equal-sized sets.
+
+The window is divided by label-observation time into a training window and a later
+out-of-time slice:
+
+    window            everything before the out-of-time slice      (Feb - Jul)
     out-of-time       the latest OOT_FRACTION of the post-cutoff    (August)
 
-Each protocol partitions `pre-cutoff + protocol period` into its own train and test,
-with the same row counts, so the arms differ only in HOW the pool is partitioned:
+"matched-window" (the default since 2026-10-01). Both arms train on the SAME rows: the
+window minus a random RANDOM_TEST_FRACTION held out as the random arm's own test set.
 
-    temporal    train = pre-cutoff            test = protocol period (chronological)
-    random      train = a random draw of the pool, same size
-                test  = a random remainder, same size as temporal's test
+    random      train = window minus R     test = R (random) and the OOT slice
+    temporal    train = the same rows      test = the OOT slice only
 
-The random arm therefore trains on rows from the protocol period -- data the temporal
-arm cannot have -- which is the leak being measured, and each arm's own test set is
-what that protocol would report.
+The arms then differ only in how each carves its validation slice out of those rows
+(`holdout_split`: a random 10% vs the most recent 10%), which sets the threshold for
+every model and the epoch count for the neural ones. "Random, Random" against
+"Random, OOT" is the optimism of random evaluation on one model; "Random, OOT" against
+"Temporal, OOT" is the effect of selecting on recent data, with training data held
+fixed. The temporal arm's test set IS the OOT slice, so its protocol metrics and its
+`oot` block describe the same rows.
 
-The out-of-time slice is then scored by BOTH models. Neither trained on any of it and
-nothing is selected on it, so it is a second test set rather than a validation set: it
-shows whether the random protocol's advantage survives into a period later than
-anything either model saw, or evaporates.
+"shared-oot" (2026-09-23 to 2026-10-01). The arms partition the window differently:
+temporal trains on the pre-cutoff rows and tests on the protocol period (July); the
+random arm draws the same sizes at random, so it trains on July rows the temporal arm
+cannot see. Both are also scored on the OOT slice -- but with unequal training windows,
+so an OOT difference mixes protocol with recency.
 
 "legacy" restores the pre-2026-09-23 behaviour, where the random arm permuted the
 whole window and the two arms were scored on different rows.
@@ -38,16 +62,23 @@ import numpy as np
 
 SPLIT_RNG_SEED = 42
 
-SPLIT_DESIGN = os.environ.get("FIFE_SPLIT_DESIGN", "shared-oot")
+SPLIT_DESIGN = os.environ.get("FIFE_SPLIT_DESIGN", "8020")
+
+# 8020 and matched-window: share of the training window held out at random as the
+# random arm's own test set.
+RANDOM_TEST_FRACTION = float(os.environ.get("FIFE_RANDOM_TEST_FRACTION", "0.10"))
 
 # Latest share of the post-cutoff population held out as the common out-of-time test
 # set. 0.41 is August on the Feb-Aug window; the remainder (July) is the protocol
 # period that the two arms partition between them.
 OOT_FRACTION = float(os.environ.get("FIFE_OOT_FRACTION", "0.41"))
 
+# 8020: share of the training rows (by submit time) that sets the validation date V.
+VAL_FRAC = float(os.environ.get("FIFE_VAL_FRAC", "0.10"))
+
 
 def build_splits(tri_t, tei_t, order, n_rows=None, design=None, oot_fraction=None,
-                 seed=SPLIT_RNG_SEED, verbose=True):
+                 seed=SPLIT_RNG_SEED, verbose=True, qs=None, cutoff=None):
     """Build both protocol arms plus the shared out-of-time slice.
 
     `tri_t` / `tei_t` are index arrays for the pre- and post-cutoff populations, as
@@ -74,9 +105,30 @@ def build_splits(tri_t, tei_t, order, n_rows=None, design=None, oot_fraction=Non
         return {"random": (rtr, rte), "temporal": (tri_t, tei_t),
                 "oot": np.array([], dtype=np.int64)}
 
-    if design != "shared-oot":
+    if design == "8020":
+        if qs is None or cutoff is None or n_rows is None:
+            raise ValueError("the 8020 design needs qs, cutoff and n_rows")
+        qs_a = np.asarray(qs, dtype=np.float64)
+        # Drawn first from the seeded generator, over every row, exactly as
+        # experiment-setup.ipynb step 5 does -- so R is the same set of jobs.
+        in_r = rng.random(int(n_rows)) < RANDOM_TEST_FRACTION
+        window = np.sort(tri_t)
+        te_random = window[in_r[window]]
+        train = window[~in_r[window]]
+        post = np.sort(tei_t)
+        straddle = qs_a[post] < cutoff
+        oot = post[~straddle]
+        if verbose:
+            print(f"[8020 split] window {len(window):,} | both arms train on the same "
+                  f"{len(train):,} rows | random test R {len(te_random):,} "
+                  f"({RANDOM_TEST_FRACTION:.0%} of the window)", flush=True)
+            print(f"[8020 split] test {len(post):,} -> {len(oot):,} after purging "
+                  f"{int(straddle.sum()):,} straddlers queued before the cutoff", flush=True)
+        return {"random": (train, te_random), "temporal": (train, oot), "oot": oot}
+
+    if design not in ("matched-window", "shared-oot"):
         raise ValueError(f"unknown split design {design!r}; "
-                         f"expected 'shared-oot' or 'legacy'")
+                         f"expected '8020', 'matched-window', 'shared-oot' or 'legacy'")
 
     # Rank the post-cutoff rows chronologically; unknown times sort last.
     ot = np.asarray(order, dtype=np.float64)[tei_t]
@@ -91,7 +143,28 @@ def build_splits(tri_t, tei_t, order, n_rows=None, design=None, oot_fraction=Non
     proto = np.sort(tei_t[rank[:cut]])      # earlier post-cutoff: the protocol period
     oot = np.sort(tei_t[rank[cut:]])        # latest: scored by both arms
 
-    # Temporal arm: the chronological partition of the pool.
+    if design == "matched-window":
+        window = np.concatenate([tri_t, proto])
+        shuffled = rng.permutation(window)
+        n_te = int(round(RANDOM_TEST_FRACTION * len(window)))
+        te_random = np.sort(shuffled[:n_te])
+        train = np.sort(shuffled[n_te:])
+        if verbose:
+            import datetime as _dt
+            _ot = np.asarray(order, dtype=np.float64)
+            _d = lambda x: (_dt.datetime.fromtimestamp(float(x), _dt.timezone.utc)
+                            .strftime("%Y-%m-%d") if np.isfinite(x) else "?")
+            print(f"[matched-window split] window {len(window):,} through "
+                  f"{_d(np.nanmax(_ot[window]))} | both arms train on the same "
+                  f"{len(train):,} rows | random test {len(te_random):,} "
+                  f"({RANDOM_TEST_FRACTION:.0%} of the window, drawn at random)",
+                  flush=True)
+            print(f"[matched-window split] out-of-time test {len(oot):,} rows from "
+                  f"{_d(np.nanmin(_ot[oot]))}: the temporal arm's only test set, and "
+                  f"the random arm's second", flush=True)
+        return {"random": (train, te_random), "temporal": (train, oot), "oot": oot}
+
+    # shared-oot. Temporal arm: the chronological partition of the pool.
     tr_temporal, te_temporal = tri_t, proto
 
     # Random arm: the same pool partitioned at random, sized to match exactly, so the
@@ -120,6 +193,37 @@ def build_splits(tri_t, tei_t, order, n_rows=None, design=None, oot_fraction=Non
     return {"random": (tr_random, te_random),
             "temporal": (tr_temporal, te_temporal),
             "oot": oot}
+
+
+def val_start_date(qs, train_idx, val_frac=None):
+    """The validation date V: the UTC midnight nearest the point where (1 - val_frac)
+    of `train_idx` had been submitted (experiment-setup.ipynb step 6). The harness
+    computes it once from the E1/E3 training rows and uses it for every experiment."""
+    val_frac = VAL_FRAC if val_frac is None else float(val_frac)
+    q = np.asarray(qs, dtype=np.float64)[np.asarray(train_idx)]
+    q = q[np.isfinite(q)]
+    qv = float(np.quantile(q, 1 - val_frac))
+    day = 86400.0
+    return min((np.floor(qv / day) * day, np.ceil(qv / day) * day),
+               key=lambda c: abs((q < c).mean() - (1 - val_frac)))
+
+
+def validation_split(tri, split, qs, val_start, seed=SPLIT_RNG_SEED):
+    """(fit, validation) index arrays carved out of the training rows `tri`.
+
+    Temporal arm: validation = jobs submitted on or after `val_start`; every job
+    submitted before it trains, including jobs still running at V. Random arm: a
+    random draw of exactly as many jobs, so both arms fit and validate on the same
+    number of rows. The draw uses the split seed, not the model seed, so every model
+    seed sees the same partition.
+    """
+    tri = np.sort(np.asarray(tri))
+    late = np.asarray(qs, dtype=np.float64)[tri] >= val_start
+    if split == "temporal":
+        return tri[~late], tri[late]
+    pick = np.zeros(len(tri), dtype=bool)
+    pick[np.random.default_rng(seed).choice(len(tri), int(late.sum()), replace=False)] = True
+    return tri[~pick], tri[pick]
 
 
 def describe(splits, qs=None, cutoff_epoch=None):

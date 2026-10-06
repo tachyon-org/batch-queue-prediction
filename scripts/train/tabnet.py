@@ -113,9 +113,11 @@ def tabnet_fit_eval(
         cat_idxs=cat_idxs,
         cat_dims=cat_dims,
         optimizer_fn=torch.optim.Adam,
-        # lr 0.02 with the scheduler stepping every 5 epochs
-        optimizer_params=dict(lr=2e-2),
-        scheduler_params={"step_size": 5, "gamma": 0.9},
+        # The library default (lr 2e-2, StepLR every 5 epochs) diverges here: an epoch
+        # is thousands of steps and the refit is only 1-3 epochs, so the schedule never
+        # decays. Lower rate, stepped every epoch. See MODELING.md 14.5.
+        optimizer_params=dict(lr=2e-3),
+        scheduler_params={"step_size": 1, "gamma": 0.9},
         scheduler_fn=torch.optim.lr_scheduler.StepLR,
         mask_type="sparsemax",
         seed=seed,

@@ -17,7 +17,7 @@ from eval.paths import DATA_ROOT
 from eval.splits import build_splits
 
 # 2025-07-01 00:00 UTC, the deployment cutoff the temporal protocol simulates.
-DEFAULT_CUTOFF = "2025-07-01"
+DEFAULT_CUTOFF = "2025-07-10"
 # 2025-01-01: timestamps below this are unset sentinels, not real dates.
 WINDOW_FLOOR = 1735689600
 # The random split is drawn with this fixed generator so it is identical in the
@@ -101,9 +101,10 @@ def load_experiment(experiment="e2", cutoff=DEFAULT_CUTOFF, data_root=None,
     tr_t, te_t, _ = temporal_masks(qs, cut, label_time=tau, verbose=verbose)
     tri_t, tei_t = np.where(tr_t)[0], np.where(te_t)[0]
 
-    # Both arms come from eval/splits.py, which feat-engineering.ipynb also calls,
-    # so the notebook that writes the matrices and this loader cannot disagree.
-    _sp = build_splits(tri_t, tei_t, order=tau, n_rows=len(qs), verbose=verbose)
+    # Both arms come from eval/splits.py, the same builder the harness and
+    # experiment-setup.ipynb use, so they cannot disagree.
+    _sp = build_splits(tri_t, tei_t, order=tau, n_rows=len(qs), verbose=verbose,
+                       qs=qs, cutoff=cut)
     oot = _sp.pop("oot")
     splits = _sp
 

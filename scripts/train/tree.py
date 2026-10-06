@@ -174,6 +174,9 @@ def _xgb_cls(spw, seed=42, ncat=0, nfeat=None, X=None, cat_idx=None):
     kw = dict(
         tree_method="hist", device=XGB_DEV, n_estimators=200, max_depth=8,
         learning_rate=0.1, scale_pos_weight=spw, eval_metric="logloss",
+        # Same sampling as _xgb_reg (constants below). Without it `hist` is
+        # deterministic, so E1/E3 seeds 0,1,2 produced bit-identical fits.
+        subsample=_SUBSAMPLE, colsample_bytree=_COLSAMPLE,
         random_state=seed,
     )
     idx = cat_idx if cat_idx is not None else _cat_idx(ncat, X)
@@ -190,6 +193,25 @@ def _xgb_cls(spw, seed=42, ncat=0, nfeat=None, X=None, cat_idx=None):
 # act on, so a multi-seed run returns identical fits and a spread of exactly 0.
 _SUBSAMPLE = 0.1        # 10% of rows per tree (~4.8M at this scale)
 _COLSAMPLE = 0.8
+
+# One set of model hyperparameters for classification (E1/E3) and regression (E2), so
+# the experiments differ only in data and loss. 200 trees, depth 8, lr 0.1 and the
+# sampling above, as XGBoost already used in both.
+_LGBM_PARAMS = dict(n_estimators=200, num_leaves=255, max_depth=8, learning_rate=0.1,
+                    subsample=_SUBSAMPLE, subsample_freq=1,  # freq >= 1 or subsample is ignored
+                    colsample_bytree=_COLSAMPLE)
+# CatBoost's default Bayesian bootstrap ignores `subsample`; Bernoulli takes it.
+_CB_PARAMS = dict(iterations=200, depth=8, learning_rate=0.1, bootstrap_type="Bernoulli",
+                  subsample=_SUBSAMPLE, rsm=_COLSAMPLE)
+
+
+def _lgbm_jobs():
+    """LightGBM thread count, the same for every task. LightGBM is CPU-bound and takes
+    every core it is given; at n_jobs=all it starved a concurrent GPU trainer of the
+    host cores it needs for batching (an MLP seed ran 1.84x slower alongside it). The
+    default keeps ~25% of the machine free; FIFE_LGBM_JOBS overrides."""
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 4
+    return int(os.environ.get("FIFE_LGBM_JOBS", max(1, int(n * 0.75))))
 
 
 def _xgb_reg(seed=42, ncat=0, nfeat=None, X=None, cat_idx=None):
@@ -217,46 +239,19 @@ def _xgb_prep(arr):
 
 def _sk_cls(lib, spw, seed=42, ncat=0, X=None, cat_idx=None):
     if lib == "lightgbm":
-        import os
-        # Leave headroom. LightGBM is CPU-bound and will take every core it is given;
-        # at n_jobs=all it starved a concurrent GPU trainer of the host cores it needs
-        # for batching (an MLP seed ran 1.84x slower alongside it). FIFE_LGBM_JOBS
-        # overrides; the default keeps ~25% of the machine free for whatever else runs.
-        _all = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 4
-        avail_cores = int(os.environ.get("FIFE_LGBM_JOBS", max(1, int(_all * 0.75))))
-        
         return LGBMClassifier(
-            n_estimators=100,
-            num_leaves=31,          # Standard leaf limit (fast & effective)
-            max_depth=-1,           # Eliminates depth truncation & "best gain: -inf" warnings
-            learning_rate=0.1,
-            n_jobs=avail_cores,
-            subsample=0.1,          # Bagging: samples 10% (4.8M rows) per tree for high speed
-            subsample_freq=1,
-            colsample_bytree=0.8,
-            min_child_samples=1000, # Stops micro-splits on 48M dataset
-            scale_pos_weight=spw,
-            # subsample=0.1 above makes this fit genuinely stochastic, so the seed
-            # is load-bearing here rather than cosmetic.
-            random_state=seed,
-            verbose=-1,
-            verbosity=-1            # Explicitly quets C++ core warnings
+            device=LGBM_DEV, **_LGBM_PARAMS,
+            n_jobs=_lgbm_jobs(), scale_pos_weight=spw,
+            random_state=seed, verbose=-1,
         )
     elif lib == "catboost":
         _task, _dev, _part = _cb_device()
-        kw = dict(
-            task_type=_task,
-            iterations=200,
-            depth=8,
-            learning_rate=0.1,
-            verbose=False,
-            allow_writing_files=False,
-            scale_pos_weight=spw,
-            random_seed=seed
-        )
+        kw = dict(task_type=_task, **_CB_PARAMS, verbose=False,
+                  allow_writing_files=False, scale_pos_weight=spw, random_seed=seed)
         if _task == "GPU":
             kw["devices"] = _dev
             kw["gpu_ram_part"] = _part
+            kw.pop("rsm", None)          # rsm is unsupported on CatBoost GPU
         _ci = cat_idx if cat_idx is not None else _cat_idx(ncat, X)
         if _ci:
             kw["cat_features"] = _ci
@@ -267,16 +262,12 @@ def _sk_cls(lib, spw, seed=42, ncat=0, X=None, cat_idx=None):
 def _sk_reg(lib, seed=42, ncat=0, X=None, cat_idx=None):
     if lib == "lightgbm":
         # subsample_freq must be >= 1 or LightGBM ignores subsample entirely.
-        return LGBMRegressor(device=LGBM_DEV, n_estimators=200, num_leaves=255, max_depth=8,
-                             learning_rate=0.1, subsample=_SUBSAMPLE, subsample_freq=1,
-                             colsample_bytree=_COLSAMPLE, n_jobs=-1, verbose=-1,
-                             random_state=seed)
+        return LGBMRegressor(device=LGBM_DEV, **_LGBM_PARAMS, n_jobs=_lgbm_jobs(),
+                             verbose=-1, random_state=seed)
     elif lib == "catboost":
-        # CatBoost's default Bayesian bootstrap ignores `subsample`; Bernoulli takes it.
         _task, _dev, _part = _cb_device()
-        kw = dict(task_type=_task, iterations=200, depth=8, learning_rate=0.1,
-              bootstrap_type="Bernoulli", subsample=_SUBSAMPLE, rsm=_COLSAMPLE,
-              verbose=False, allow_writing_files=False, random_seed=seed)
+        kw = dict(task_type=_task, **_CB_PARAMS, verbose=False, allow_writing_files=False,
+                  random_seed=seed)
         if _task == "GPU":
             kw["devices"] = _dev
             kw["gpu_ram_part"] = _part

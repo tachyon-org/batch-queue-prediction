@@ -46,7 +46,7 @@ MODEL_FAMILIES = {
 }
 
 FAMILY_LABELS = {
-    "tree": "Gradient-boosted trees (split gain)",
+    "tree": "Gradient-boosted trees (split gain; CatBoost: PredictionValuesChange)",
     "neural": "Neural models (permutation importance; TabNet: attention mass)",
 }
 
@@ -576,37 +576,6 @@ def cascade_metrics(y_hw, p_fail, p_hw_cond, thr_fail=None, thr_attr=None):
             }
     return out
 
-
-def bootstrap_ci(y_true, scores, metric="pr_auc", n_boot=200, seed=DEFAULT_SEED, alpha=0.05):
-    """Percentile bootstrap interval for a ranking metric on one test set.
-
-    Answers "is this gap larger than test-set noise?", which is a different
-    question from seed variance (see `aggregate_seeds`) -- this resamples the test
-    rows and holds the fit fixed, that one refits and holds the test set fixed. A
-    paper claiming one model beats another wants both.
-    """
-    y_true = np.asarray(y_true)
-    scores = np.asarray(scores)
-    fn = average_precision_score if metric == "pr_auc" else roc_auc_score
-    rng = np.random.default_rng(seed)
-    n = len(y_true)
-    vals = []
-    for _ in range(n_boot):
-        b = rng.integers(0, n, n)
-        yb = y_true[b]
-        # A resample with a single class leaves both metrics undefined.
-        if yb.min() == yb.max():
-            continue
-        vals.append(fn(yb, scores[b]))
-    vals = np.sort(vals)
-    return {
-        "point": float(fn(y_true, scores)),
-        "lo": float(np.quantile(vals, alpha / 2)) if len(vals) else float("nan"),
-        "hi": float(np.quantile(vals, 1 - alpha / 2)) if len(vals) else float("nan"),
-        "n_boot": int(len(vals)),
-    }
-
-
 def aggregate_seeds(runs, keys=None):
     """Mean, std and range across repeated fits that differ only by seed.
 
@@ -659,25 +628,6 @@ def collect_seed_runs(exp_name, lib, split, results_dir=None):
     entry = data.get(lib, {})
     runs = [v for k, v in entry.items() if k == split or k.startswith(f"{split}__seed")]
     return runs
-
-
-def seed_summary_table(exp_name, libs, split, metrics, results_dir=None):
-    """mean +/- std across seeds, one row per model -- the variance table a paper needs.
-
-    `metrics` are dotted paths into the metric dict, e.g. "hardware.pr_auc".
-    Models fitted under a single seed report std 0.0 with n=1, which is a placeholder
-    and not evidence of stability; report the seed count alongside.
-    """
-    rows = {}
-    for lib in libs:
-        runs = collect_seed_runs(exp_name, lib, split, results_dir)
-        if not runs:
-            continue
-        agg = aggregate_seeds(runs)
-        rows[lib] = {m: agg.get(m) for m in metrics}
-        rows[lib]["n_seeds"] = agg.get("n_seeds", 0)
-    return rows
-
 
 # ---- Temporal partitioning on label-observation time ----
 def terminal_time(completion, job_start=None, wall_clock=None, qdate=None, floor=None):
@@ -757,19 +707,6 @@ def temporal_masks(qs, cutoff, label_time=None, verbose=True):
         print(f"[temporal split] train {stats['n_train']:,} | test {stats['n_test']:,}{extra}",
               flush=True)
     return train, test, stats
-
-
-# ---- Entity memorization ----
-def entity_seen_mask(entity, train_mask, test_mask):
-    """Boolean over the TEST rows: True where that entity also occurs in training.
-
-    Splitting the test set this way measures entity memorization without retraining
-    and without changing the time period, which is what separates it from the
-    random-vs-temporal gap.
-    """
-    entity = np.asarray(entity)
-    seen = set(np.unique(entity[np.asarray(train_mask, dtype=bool)]).tolist())
-    return np.array([e in seen for e in entity[np.asarray(test_mask, dtype=bool)]], dtype=bool)
 
 
 def entity_memorization(y_true, probs, seen, entity_name="entity", min_n=1000):
@@ -952,74 +889,6 @@ def _cold_start_reg(y_true, pred, seen, entity_name, min_n):
         if k in out["seen"] and k in out["unseen"]:
             out[f"delta_{k}"] = out["seen"][k] - out["unseen"][k]
     return out
-
-
-def matched_test_masks(qs, cutoff, label_time=None, test_frac=0.5, seed=DEFAULT_SEED,
-                       verbose=True):
-    """Two training protocols scored on one identical test set.
-
-    The random-vs-temporal gap as usually run moves four things at once: chronology,
-    the test population, its class prevalence, and entity overlap. Attributing the
-    whole gap to memorization is therefore not supported.
-
-    This holds the evaluation set fixed. A random half of the post-cutoff period is
-    reserved as the test set for BOTH protocols; the other half stays available for
-    training. The two training pools are then subsampled to an identical size, so
-    the only thing that differs between them is whether training contains jobs
-    contemporaneous with the test period:
-
-      train_honest  -- pre-cutoff jobs only (temporally honest)
-      train_leaky   -- pre-cutoff jobs plus the post-cutoff jobs held out of the test
-
-    Any remaining gap cannot be explained by a different test population, a different
-    base rate, or a different test size, because all three are identical by
-    construction.
-    """
-    qs = np.asarray(qs, dtype=np.float64)
-    pre, post = qs < cutoff, qs >= cutoff
-
-    rng = np.random.default_rng(seed)
-    post_idx = np.where(post)[0]
-    perm = rng.permutation(len(post_idx))
-    n_test = int(round(test_frac * len(post_idx)))
-    test_idx = np.sort(post_idx[perm[:n_test]])
-    post_train_idx = np.sort(post_idx[perm[n_test:]])
-
-    test = np.zeros_like(pre); test[test_idx] = True
-
-    honest_pool = pre.copy()
-    if label_time is not None:
-        lt = np.asarray(label_time, dtype=np.float64)
-        usable = np.isfinite(lt) & (lt > 0)
-        honest_pool &= ~(usable & (lt >= cutoff))
-
-    leaky_pool = honest_pool.copy(); leaky_pool[post_train_idx] = True
-
-    # Match training size so the comparison is not confounded by sample size.
-    n_match = int(min(honest_pool.sum(), leaky_pool.sum()))
-    def _subsample(mask):
-        idx = np.where(mask)[0]
-        if len(idx) <= n_match:
-            return mask
-        keep = np.sort(rng.choice(idx, n_match, replace=False))
-        out = np.zeros_like(mask); out[keep] = True
-        return out
-
-    train_honest, train_leaky = _subsample(honest_pool), _subsample(leaky_pool)
-    stats = {
-        "n_test": int(test.sum()),
-        "n_train_honest": int(train_honest.sum()),
-        "n_train_leaky": int(train_leaky.sum()),
-        "n_post_in_leaky_train": int(train_leaky[post_train_idx].sum()),
-    }
-    assert not (train_honest & test).any() and not (train_leaky & test).any(), "test leaked into train"
-    if verbose:
-        print(f"[matched-test split] test {stats['n_test']:,} (identical for both protocols) | "
-              f"train honest {stats['n_train_honest']:,} | train leaky "
-              f"{stats['n_train_leaky']:,} of which {stats['n_post_in_leaky_train']:,} "
-              f"are contemporaneous with the test period", flush=True)
-    return train_honest, train_leaky, test, stats
-
 
 # ---- Probability calibration ----
 def fit_calibrator(p_val, y_val, method="isotonic", clip=1e-6):
@@ -2157,48 +2026,6 @@ def _klabel(k):
         return " ".join([model_part] + rest)
     return MODEL_DISPLAY_NAMES.get(str(k).lower(), str(k))
 
-
-def plot_confusions(cm_dict, class_labels, title, ncols=None, normalize=True):
-    keys = list(cm_dict)
-    if not keys:
-        print(f"[skip] {title}: no data (run the producing cell first)")
-        return
-    ncols = ncols or len(keys)
-    nrows = int(np.ceil(len(keys) / ncols))
-    fig, axes = plt.subplots(
-        nrows, ncols, figsize=(4.8 * ncols, 4.5 * nrows), squeeze=False
-    )
-    for ax in axes.flat:
-        ax.axis("off")
-    for i, k in enumerate(keys):
-        ax = axes.flat[i]
-        ax.axis("on")
-        cm = np.asarray(cm_dict[k], float)
-        M = cm / np.maximum(cm.sum(1, keepdims=True), 1) if normalize else cm
-        sns.heatmap(
-            M,
-            annot=True,
-            fmt=".2f" if normalize else ".0f",
-            cmap="Blues",
-            vmin=0,
-            vmax=1 if normalize else None,
-            cbar=False,
-            square=True,
-            xticklabels=class_labels,
-            yticklabels=class_labels,
-            annot_kws={"size": 12},
-            ax=ax,
-        )
-        ax.set_title(_klabel(k), pad=10)
-        ax.set_xlabel("predicted")
-        ax.set_ylabel("true")
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
-        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-    fig.suptitle(title, y=1.03)
-    plt.tight_layout()
-    plt.show()
-
-
 def _clean_and_normalize(arr):
     """Clamps negative permutation noise to 0 and normalizes vector to sum to 100%."""
     a = np.nan_to_num(np.asarray(arr, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
@@ -2215,12 +2042,12 @@ def feature_split_imp_heatmap(
     cardinality_threshold: int = 50,  # Threshold if cards is a dict/list
     split_key: str = "temporal",
     models: list[str] = None,
-    title: str = "Normalized Feature Importance",
-    cmap: str = "Blues",
+    title: str = None,
+    cmap=None,
     min_importance_threshold: float = 0.1,
-    output_prefix: str = "temporal_imp_side_by_side",
+    output_prefix: str = "feature_split_imp_heatmap",
 ):
-    """Renders two side-by-side heatmaps separating Categorical vs. Non-Categorical features
+    """Renders importance heatmaps separating Categorical vs. Non-Categorical features
 
     using schema metadata (n_cat, cards, or cat_cols).
     """
@@ -2246,27 +2073,25 @@ def feature_split_imp_heatmap(
         if m not in ordered_models and (m, split_key) in imp_dict:
             ordered_models.append(m)
 
-    rows = {}
-    for m in ordered_models:
-        val = imp_dict[(m, split_key)]
+    def _norm_rows(sk):
+        """Each model's importances on split `sk`, scaled by that row's maximum."""
+        out = {}
+        for m in ordered_models:
+            val = imp_dict.get((m, sk))
+            if isinstance(val, np.ndarray):
+                series = pd.Series(val, index=feats[: len(val)])
+            elif isinstance(val, (pd.Series, dict)):
+                series = pd.Series(val).reindex(feats)
+            else:
+                continue
+            series = series.reindex(feats).fillna(0.0)
+            max_val = np.nanmax(np.abs(series.values))
+            if max_val > 0:
+                series = series / max_val
+            out[display_names.get(m.lower(), m)] = series
+        return out
 
-        if isinstance(val, np.ndarray):
-            series = pd.Series(val, index=feats[: len(val)])
-        elif isinstance(val, (pd.Series, dict)):
-            series = pd.Series(val).reindex(feats)
-        else:
-            continue
-
-        series = series.fillna(0.0)
-
-        # Row-wise max-normalization
-        max_val = np.nanmax(np.abs(series.values))
-        if max_val > 0:
-            series = series / max_val
-
-        disp_name = display_names.get(m.lower(), m)
-        rows[disp_name] = series
-
+    rows = _norm_rows(split_key)
     if not rows:
         print(
             f"[skip] {title}: no valid model data found for split '{split_key}'"
@@ -2275,6 +2100,14 @@ def feature_split_imp_heatmap(
 
     df = pd.DataFrame(rows).T
     df.columns = feats
+
+    # Which features appear, and in what order, is decided from EVERY split in
+    # imp_dict, so the random and temporal figures share one x axis and can be read
+    # column by column.
+    _splits = sorted({k[1] for k in imp_dict if isinstance(k, tuple)})
+    col_score = pd.concat(
+        [pd.DataFrame(_norm_rows(sk)).T.abs().max(axis=0) for sk in _splits
+         if _norm_rows(sk)], axis=1).max(axis=1).reindex(feats).fillna(0.0)
 
     # --- Step 1: Detect Categorical Features using Metadata ---
     detected_cat = set()
@@ -2323,296 +2156,144 @@ def feature_split_imp_heatmap(
         df[non_cat_feats] if non_cat_feats else pd.DataFrame(index=df.index)
     )
 
-    # --- Step 2: Apply Threshold & Sorting ---
-    if min_importance_threshold > 0:
-        if not df_cat.empty:
-            df_cat = df_cat.loc[
-                :, df_cat.abs().max(axis=0) >= min_importance_threshold
-            ]
-        if not df_non_cat.empty:
-            df_non_cat = df_non_cat.loc[
-                :, df_non_cat.abs().max(axis=0) >= min_importance_threshold
-            ]
+    # --- Step 2: Apply Threshold & Sorting, on the all-splits score ---
+    def _select(frame):
+        if frame.empty:
+            return frame
+        keep = [c for c in frame.columns if col_score[c] >= min_importance_threshold]
+        return frame[sorted(keep, key=lambda c: -col_score[c])]
 
-    if not df_cat.empty:
-        sort_cat = df_cat.abs().max(axis=0).sort_values(ascending=False).index
-        df_cat = df_cat[sort_cat]
-
-    if not df_non_cat.empty:
-        sort_non_cat = (
-            df_non_cat.abs().max(axis=0).sort_values(ascending=False).index
-        )
-        df_non_cat = df_non_cat[sort_non_cat]
+    df_cat, df_non_cat = _select(df_cat), _select(df_non_cat)
 
     if df_cat.empty and df_non_cat.empty:
         print(f"[skip] {title}: all features fell below importance threshold")
         return
 
-    # --- Step 3: Render Side-by-Side Figure ---
-    sns.plotting_context("talk")
-    plt.rcParams.update({"font.family": "serif"})
-
-    n_cat_cols = max(len(df_cat.columns), 1)
-    n_non_cat_cols = max(len(df_non_cat.columns), 1)
-    total_cols = n_cat_cols + n_non_cat_cols
-
-    fig, (ax1, ax2) = plt.subplots(
-        1,
-        2,
-        figsize=(5 + 1.2 * total_cols, 2.5 + 0.8 * len(rows)),
-        gridspec_kw={
-            "width_ratios": [n_cat_cols, n_non_cat_cols],
-            "wspace": 0.08,
-        },
-    )
-
-    # Plot 1: Categoricals
-    if not df_cat.empty:
-        sns.heatmap(
-            df_cat,
-            cmap=cmap,
-            vmin=0.0,
-            vmax=1.0,
-            annot=True,
-            fmt=".2f",
-            annot_kws={"size": 20},
-            cbar=False,
-            linewidths=0.5,
-            linecolor="white",
-            ax=ax1,
-        )
-        ax1.set_title(
-            "Categorical Features", pad=12, fontsize=24, fontweight="bold"
-        )
-    else:
-        ax1.text(
-            0.5,
-            0.5,
-            "No Categorical Features",
-            ha="center",
-            va="center",
-            fontsize=18,
-        )
-
-    # Plot 2: Continuous Features
-    if not df_non_cat.empty:
-        sns.heatmap(
-            df_non_cat,
-            cmap=cmap,
-            vmin=0.0,
-            vmax=1.0,
-            annot=True,
-            fmt=".2f",
-            annot_kws={"size": 20},
-            cbar_kws={
-                "label": "Normalized Importance ($I / I_{\\max}$)",
-                "shrink": 0.6,
-                "pad": 0.02,
-            },
-            linewidths=0.5,
-            linecolor="white",
-            ax=ax2,
-        )
-        ax2.set_title(
-            "Continuous Features",
-            pad=12,
-            fontsize=24,
-            fontweight="bold",
-        )
-    else:
-        ax2.text(
-            0.5,
-            0.5,
-            "No Continuous Features",
-            ha="center",
-            va="center",
-            fontsize=18,
-        )
-
-    # --- Formatting Axes ---
-    for ax in (ax1, ax2):
-        ax.tick_params(length=0)
-        ax.set_xlabel("")
-        ax.set_ylabel("")
-        ax.set_xticklabels(
-            ax.get_xticklabels(), rotation=45, ha="right", fontsize=22
-        )
-
-    # Y-axis styling
-    ax1.set_yticklabels(
-        ax1.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22
-    )
-    ax2.tick_params(
-        left=False, labelleft=False
-    )  # Hide duplicate Y-labels on right plot
-
-    # Colorbar styling
-    if not df_non_cat.empty and len(ax2.collections) > 0:
-        cbar = ax2.collections[0].colorbar
-        cbar.set_ticks([0.0, 0.5, 1.0])
-        cbar.ax.tick_params(labelsize=18)
-        cbar.set_label(
-            "Normalized Importance ($I / I_{\\max}$)",
-            fontsize=22,
-            fontweight="bold",
-            labelpad=12,
-        )
-
-    fig.suptitle(title, y=1.02, fontsize=30)
-    plt.tight_layout()
-
-    # Save logic
-    notebook_dir = os.getcwd()
-    figures_dir = os.path.join(notebook_dir, "output")
-    os.makedirs(figures_dir, exist_ok=True)
-
-    pdf_path = os.path.join(figures_dir, f"{output_prefix}.pdf")
-    png_path = os.path.join(figures_dir, f"{output_prefix}.png")
-
-    plt.savefig(pdf_path, bbox_inches="tight")
-    plt.savefig(png_path, bbox_inches="tight", dpi=300)
-    plt.show()
-
+    # --- Step 3: Render, trees and neural models in separate row blocks ---
+    if cmap is None:
+        from matplotlib.colors import LinearSegmentedColormap
+        from eval.style import COLORS
+        cmap = LinearSegmentedColormap.from_list("imp", ["#FFFFFF", COLORS["primary"]])
+    _disp = {display_names.get(m.lower(), m): model_family(m) for m in ordered_models}
+    _title = title or f"Normalized Feature Importance, {split_key.capitalize()} Split"
+    _family_block_heatmap(
+        df_cat, df_non_cat, _disp, cmap=cmap, vmin=0.0, vmax=1.0, center=None,
+        cbar_ticks=[0.0, 0.5, 1.0], cbar_ticklabels=["0", "0.5", "1"],
+        cbar_label="Importance within row, $I / I_{\\max}$", title=_title,
+        note=("Each row is scaled by its own largest importance: colour compares "
+              "features within a row, not magnitudes between rows.\n" + _ATTRIBUTION_NOTE),
+        output_prefix=f"{output_prefix}_{split_key}")
     return df_cat, df_non_cat
 
 
-def imp_heatmap(
-    imp_dict: dict,
-    feats: list[str],
-    split_key: str = "temporal",
-    models: list[str] = None,
-    title: str = "Normalized Feature Importance",
-    cmap: str = "Blues",
-    min_importance_threshold: float = 0.1,
-    output_prefix: str = "temporal_imp_heatmap",
-):
-    all_keys = list(imp_dict.keys())
-    available_models = (
-        set(k[0] for k in all_keys if isinstance(k, tuple))
-        if models is None
-        else set(models)
-    )
+_SHIFT_FONT = 14   # the bar charts' FONT in prediction-analysis.ipynb
 
-    preferred_order = globals().get("PREFERRED_MODEL_ORDER", [])
-    display_names = globals().get("MODEL_DISPLAY_NAMES", {})
 
-    # Order models according to preferred_order and available models
-    ordered_models = []
-    for pref in preferred_order:
-        for m in available_models:
-            if m.lower() == pref and m not in ordered_models:
-                if (m, split_key) in imp_dict:
-                    ordered_models.append(m)
+def _shift_rc(base=_SHIFT_FONT):
+    """The bar charts' rcParams, so heatmaps and bar charts share typeface and sizes."""
+    return {
+        "font.family": "sans-serif",
+        "font.sans-serif": "Nimbus Sans",
+        "font.size": base,
+        "axes.labelsize": base + 1,
+        "axes.titlesize": base + 1,
+        "xtick.labelsize": base,
+        "ytick.labelsize": base,
+        "axes.grid": False,
+    }
 
-    for m in sorted(available_models):
-        if m not in ordered_models and (m, split_key) in imp_dict:
-            ordered_models.append(m)
 
-    rows = {}
-    for m in ordered_models:
-        val = imp_dict[(m, split_key)]
+def _shift_cmap():
+    """Diverging map in the paper's split colours: delta = temporal - random, so a
+    feature that gains share under the temporal split takes the temporal colour."""
+    from matplotlib.colors import LinearSegmentedColormap
+    from eval.style import COLORS
+    return LinearSegmentedColormap.from_list(
+        "shift", [COLORS["secondary"], "#FFFFFF", COLORS["primary"]])
 
-        # Map numpy array, pandas Series, or dict to feature list
-        if isinstance(val, np.ndarray):
-            series = pd.Series(val, index=feats[: len(val)])
-        elif isinstance(val, (pd.Series, dict)):
-            series = pd.Series(val).reindex(feats)
-        else:
-            continue
 
-        series = series.fillna(0.0)
+_FAMILY_ROW_LABELS = {"tree": "Trees\n(gain)", "neural": "Neural\n(permutation)"}
+_ATTRIBUTION_NOTE = (
+    "Trees are attributed by split gain (CatBoost: PredictionValuesChange); neural "
+    "models by permutation importance (drop in ROC-AUC), TabNet by attention-mask "
+    "mass. These are different quantities, so the two blocks are not on a common scale.")
 
-        # Row-wise max-normalization: Maps each model's maximum importance to [0.0, 1.0]
-        max_val = np.nanmax(np.abs(series.values))
-        if max_val > 0:
-            series = series / max_val
 
-        disp_name = display_names.get(m.lower(), m)
-        rows[disp_name] = series
+def _family_block_heatmap(df_cat, df_non_cat, row_family, *, cmap, vmin, vmax, center,
+                          cbar_ticks, cbar_ticklabels, cbar_label, title, note,
+                          output_prefix):
+    """One table with rows grouped by model family (trees / neural) and columns by
+    categorical / continuous, a gap between the groups in both directions, and one
+    shared colorbar. `row_family` maps each row label to "tree", "neural" or None.
+    Saves output/<output_prefix>.pdf/.png and returns the combined frame."""
+    df_all = pd.concat([df_cat, df_non_cat], axis=1)
+    col_groups = [(t, list(d.columns)) for t, d in
+                  (("Categorical Features", df_cat), ("Continuous Features", df_non_cat))
+                  if not d.empty]
+    row_groups = []
+    for fam in ("tree", "neural", None):
+        members = [r for r in df_all.index if row_family.get(r) == fam]
+        if members:
+            row_groups.append((fam, members))
+    n_cols = sum(len(c) for _, c in col_groups)
+    n_rows = sum(len(r) for _, r in row_groups)
 
-    if not rows:
-        print(
-            f"[skip] {title}: no valid model data found for split '{split_key}'"
+    with plt.rc_context(_shift_rc()):
+        fig, axes = plt.subplots(
+            len(row_groups), len(col_groups) + 1,
+            figsize=(3.2 + 0.5 * n_cols, 1.8 + 0.5 * n_rows + 0.3 * len(row_groups)),
+            squeeze=False, layout="constrained",
+            gridspec_kw={
+                # The trailing narrow column holds the shared colorbar.
+                "width_ratios": [len(c) for _, c in col_groups] + [0.35],
+                "height_ratios": [len(r) for _, r in row_groups],
+            },
         )
-        return
+        fig.get_layout_engine().set(wspace=0.04, hspace=0.08)
 
-    df = pd.DataFrame(rows).T
-    df.columns = feats
+        for ri, (fam, rnames) in enumerate(row_groups):
+            is_last = ri == len(row_groups) - 1
+            for ci, (ctitle, cnames) in enumerate(col_groups):
+                ax = axes[ri, ci]
+                sns.heatmap(
+                    df_all.loc[rnames, cnames], cmap=cmap, center=center,
+                    vmin=vmin, vmax=vmax, annot=True, fmt=".2f",
+                    annot_kws={"size": _SHIFT_FONT - 3}, cbar=False,
+                    linewidths=0.5, linecolor="white",
+                    xticklabels=is_last, yticklabels=(ci == 0), ax=ax,
+                )
+                ax.tick_params(length=0)
+                ax.set_xlabel("")
+                ax.set_ylabel("")
+                if ri == 0:
+                    ax.set_title(ctitle, pad=8, fontweight="bold")
+                if is_last:
+                    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+                if ci == 0:
+                    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+                    ax.set_ylabel(_FAMILY_ROW_LABELS.get(fam, "Other"),
+                                  fontweight="bold", labelpad=10)
+            axes[ri, -1].axis("off")
 
-    # Filter out features below the importance threshold across all models
-    if min_importance_threshold > 0:
-        df = df.loc[:, df.abs().max(axis=0) >= min_importance_threshold]
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin, vmax))
+        cbar = fig.colorbar(sm, ax=axes[:, -1], fraction=1.0, aspect=25)
+        cbar.set_ticks(cbar_ticks)
+        cbar.set_ticklabels(cbar_ticklabels)
+        cbar.set_label(cbar_label, labelpad=8)
+        cbar.outline.set_visible(False)
 
-    # Sort columns by maximum importance in descending order
-    sorted_cols = df.abs().max(axis=0).sort_values(ascending=False).index
-    df = df[sorted_cols]
+        fig.suptitle(title, fontweight="bold", fontsize=_SHIFT_FONT + 3)
+        fig.text(0.0, -0.01, note, ha="left", va="top", fontsize=_SHIFT_FONT - 2,
+                 color="0.30", transform=fig.transFigure, wrap=True)
 
-    # Global style updates
-    sns.plotting_context("talk")
-    plt.rcParams.update({"font.family": "serif"})
+        figures_dir = os.path.join(os.getcwd(), "output")
+        os.makedirs(figures_dir, exist_ok=True)
+        plt.savefig(os.path.join(figures_dir, f"{output_prefix}.pdf"), bbox_inches="tight")
+        plt.savefig(os.path.join(figures_dir, f"{output_prefix}.png"),
+                    bbox_inches="tight", dpi=300)
+        plt.show()
+    return df_all
 
-    # Dynamic figure size matching imp_diff_heatmap proportions
-    fig, ax = plt.subplots(
-        figsize=(4 + 1.2 * len(df.columns), 2.5 + 1.1 * len(rows))
-    )
-
-    sns.heatmap(
-        df,
-        cmap=cmap,  # Sequential colormap for non-negative [0, 1] scale
-        vmin=0.0,
-        vmax=1.0,
-        annot=True,
-        fmt=".2f",
-        annot_kws={"size": 20},
-        cbar_kws={
-            "label": "Normalized Importance ($I / I_{\\max}$)",
-            "shrink": 0.5,
-            "pad": 0.01,
-        },
-        linewidths=0.5,
-        linecolor="white",
-        ax=ax,
-    )
-
-    # Colorbar formatting
-    cbar = ax.collections[0].colorbar
-    cbar.set_ticks([0.0, 0.5, 1.0])
-    cbar.ax.tick_params(labelsize=18)
-    cbar.set_label(
-        "Normalized Importance ($I / I_{\\max}$)",
-        fontsize=22,
-        fontweight="bold",
-        labelpad=12,
-    )
-
-    # Axis formatting
-    ax.tick_params(length=0)
-    ax.set_title(title, pad=15, fontsize=30)
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-
-    ax.set_xticklabels(
-        ax.get_xticklabels(), rotation=45, ha="right", fontsize=22
-    )
-    ax.set_yticklabels(
-        ax.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22
-    )
-
-    plt.tight_layout()
-
-    # Save logic matching imp_diff_heatmap
-    notebook_dir = os.getcwd()
-    figures_dir = os.path.join(notebook_dir, "output")
-    os.makedirs(figures_dir, exist_ok=True)
-
-    pdf_path = os.path.join(figures_dir, f"{output_prefix}.pdf")
-    png_path = os.path.join(figures_dir, f"{output_prefix}.png")
-
-    plt.savefig(pdf_path, bbox_inches="tight")
-    plt.savefig(png_path, bbox_inches="tight", dpi=300)
-    plt.show()
-
-    return df
 
 def imp_diff_heatmaps_by_family(imp_dict, feats, **kw):
     """Render the gain-shift heatmap once per model family.
@@ -2812,204 +2493,64 @@ def imp_diff_heatmap(
     sns.plotting_context("talk")
 
     if per_model_scale:
-        # One row per model, each with its own symmetric scale and its own colorbar.
-        df_p = pd.concat([df_cat, df_non_cat], axis=1)
-        df_p = df_p[df_p.abs().max(axis=0).sort_values(ascending=False).index]
-        n_models = len(df_p.index)
+        with plt.rc_context(_shift_rc()):
+            # One row per model, each with its own symmetric scale and its own colorbar.
+            df_p = pd.concat([df_cat, df_non_cat], axis=1)
+            df_p = df_p[df_p.abs().max(axis=0).sort_values(ascending=False).index]
+            n_models = len(df_p.index)
 
-        # constrained layout, not tight_layout: seaborn attaches a colorbar axes to
-        # every row, and tight_layout cannot place those (it warns and may shift the
-        # annotations out of their cells).
-        fig, axes = plt.subplots(
-            n_models, 1,
-            figsize=(4 + 0.9 * len(df_p.columns), 1.5 * n_models + 1.2),
-            sharex=True, squeeze=False, layout="constrained",
-        )
-        for i, model_name in enumerate(df_p.index):
-            ax = axes[i, 0]
-            row_df = df_p.loc[[model_name]]
-            lim = float(np.nanmax(np.abs(row_df.values))) or 1.0
-            is_last = i == n_models - 1
-            sns.heatmap(
-                row_df, cmap="vlag", center=0, vmin=-lim, vmax=lim,
-                annot=True, fmt=".2f", annot_kws={"size": 14},
-                cbar_kws={"label": "\u0394 (pp)", "shrink": 0.85, "pad": 0.01},
-                linewidths=0.5, linecolor="white",
-                xticklabels=df_p.columns if is_last else False, ax=ax,
+            # constrained layout, not tight_layout: seaborn attaches a colorbar axes to
+            # every row, and tight_layout cannot place those (it warns and may shift the
+            # annotations out of their cells).
+            fig, axes = plt.subplots(
+                n_models, 1,
+                figsize=(4 + 0.9 * len(df_p.columns), 1.5 * n_models + 1.2),
+                sharex=True, squeeze=False, layout="constrained",
             )
-            ax.tick_params(length=0)
-            ax.set_ylabel("")
-            ax.set_yticklabels(ax.get_yticklabels(), rotation=0,
-                               fontweight="bold", fontsize=16)
-            if is_last:
-                ax.set_xticklabels(ax.get_xticklabels(), rotation=45,
-                                   ha="right", fontsize=16)
+            for i, model_name in enumerate(df_p.index):
+                ax = axes[i, 0]
+                row_df = df_p.loc[[model_name]]
+                lim = float(np.nanmax(np.abs(row_df.values))) or 1.0
+                is_last = i == n_models - 1
+                sns.heatmap(
+                    row_df, cmap=_shift_cmap(), center=0, vmin=-lim, vmax=lim,
+                    annot=True, fmt=".2f", annot_kws={"size": _SHIFT_FONT - 3},
+                    cbar_kws={"label": "\u0394 (pp)", "shrink": 0.85, "pad": 0.01},
+                    linewidths=0.5, linecolor="white",
+                    xticklabels=df_p.columns if is_last else False, ax=ax,
+                )
+                ax.tick_params(length=0)
+                ax.set_ylabel("")
+                ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+                if is_last:
+                    ax.set_xticklabels(ax.get_xticklabels(), rotation=45,
+                                       ha="right")
 
-        sub = FAMILY_LABELS.get(family)
-        fig.suptitle(f"{title}\n{sub}" if sub else title, fontsize=20)
+            sub = FAMILY_LABELS.get(family)
+            fig.suptitle(f"{title}\n{sub}" if sub else title,
+                         fontweight="bold", fontsize=_SHIFT_FONT + 3)
 
-        figures_dir = os.path.join(os.getcwd(), "output")
-        os.makedirs(figures_dir, exist_ok=True)
-        stem = f"{output_prefix}_{family}" if family else output_prefix
-        plt.savefig(os.path.join(figures_dir, f"{stem}.pdf"), bbox_inches="tight")
-        plt.savefig(os.path.join(figures_dir, f"{stem}.png"),
-                    bbox_inches="tight", dpi=300)
-        plt.show()
+            figures_dir = os.path.join(os.getcwd(), "output")
+            os.makedirs(figures_dir, exist_ok=True)
+            stem = f"{output_prefix}_{family}" if family else output_prefix
+            plt.savefig(os.path.join(figures_dir, f"{stem}.pdf"), bbox_inches="tight")
+            plt.savefig(os.path.join(figures_dir, f"{stem}.png"),
+                        bbox_inches="tight", dpi=300)
+            plt.show()
         return df_p
 
-    # Fallback to single subplot if all features fell into one category
-    if df_cat.empty or df_non_cat.empty:
-        df_single = df_cat if not df_cat.empty else df_non_cat
-        fig, ax = plt.subplots(
-            figsize=(4 + 1.2 * len(df_single.columns), 2.5 + 0.8 * len(rows))
-        )
-
-        sns.heatmap(
-            df_single,
-            cmap="coolwarm",
-            center=0,
-            vmin=-1.0,
-            vmax=1.0,
-            annot=True,
-            fmt=".2f",
-            annot_kws={"size": 20},
-            cbar_kws={
-                "label": "Relative Shift (Δ / Max |Δ|)",
-                "shrink": 0.5,
-                "pad": 0.01,
-            },
-            linewidths=0.5,
-            linecolor="white",
-            ax=ax,
-        )
-
-        cbar = ax.collections[0].colorbar
-        cbar.set_ticks([-1.0, 0.0, 1.0])
-        cbar.ax.tick_params(labelsize=18)
-        cbar.set_label(
-            "Relative Shift (Δ / Max |Δ|)",
-            fontsize=22,
-            fontweight="bold",
-            labelpad=12,
-        )
-
-        ax.tick_params(length=0)
-        ax.set_title(title, pad=15, fontsize=30)
-        ax.set_xlabel("")
-        ax.set_ylabel("")
-        ax.set_xticklabels(
-            ax.get_xticklabels(), rotation=45, ha="right", fontsize=22
-        )
-        ax.set_yticklabels(
-            ax.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22
-        )
-
-    else:
-        # Render Side-by-Side Subplots
-        n_cat_cols = len(df_cat.columns)
-        n_non_cat_cols = len(df_non_cat.columns)
-        total_cols = n_cat_cols + n_non_cat_cols
-
-        fig, (ax1, ax2) = plt.subplots(
-            1,
-            2,
-            figsize=(5 + 1.2 * total_cols, 2.5 + 0.8 * len(rows)),
-            gridspec_kw={
-                "width_ratios": [n_cat_cols, n_non_cat_cols],
-                "wspace": 0.08,
-            },
-        )
-
-        # Plot 1: Categorical Shift
-        sns.heatmap(
-            df_cat,
-            cmap="coolwarm",
-            center=0,
-            vmin=-1.0,
-            vmax=1.0,
-            annot=True,
-            fmt=".2f",
-            annot_kws={"size": 20},
-            cbar=False,
-            linewidths=0.5,
-            linecolor="white",
-            ax=ax1,
-        )
-        ax1.set_title(
-            "Categorical Features", pad=12, fontsize=24, fontweight="bold"
-        )
-
-        # Plot 2: Continuous Shift
-        sns.heatmap(
-            df_non_cat,
-            cmap="coolwarm",
-            center=0,
-            vmin=-1.0,
-            vmax=1.0,
-            annot=True,
-            fmt=".2f",
-            annot_kws={"size": 20},
-            cbar_kws={
-                "label": "Relative Shift (Δ / Max |Δ|)",
-                "shrink": 0.6,
-                "pad": 0.02,
-            },
-            linewidths=0.5,
-            linecolor="white",
-            ax=ax2,
-        )
-        ax2.set_title(
-            "Continuous Features",
-            pad=12,
-            fontsize=24,
-            fontweight="bold",
-        )
-
-        # Axis Formatting
-        for ax in (ax1, ax2):
-            ax.tick_params(length=0)
-            ax.set_xlabel("")
-            ax.set_ylabel("")
-            ax.set_xticklabels(
-                ax.get_xticklabels(), rotation=45, ha="right", fontsize=22
-            )
-
-        ax1.set_yticklabels(
-            ax1.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22
-        )
-        ax2.tick_params(
-            left=False, labelleft=False
-        )  # Hide redundant Y labels on right subplot
-
-        # Colorbar Formatting
-        if len(ax2.collections) > 0:
-            cbar = ax2.collections[0].colorbar
-            cbar.set_ticks([-1.0, 0.0, 1.0])
-            cbar.ax.tick_params(labelsize=18)
-            cbar.set_label(
-                "Relative Shift (Δ / Max |Δ|)",
-                fontsize=22,
-                fontweight="bold",
-                labelpad=12,
-            )
-
-        fig.suptitle(title, y=1.03, fontsize=30)
-
-    plt.tight_layout()
-
-    # Save logic
-    notebook_dir = os.getcwd()
-    figures_dir = os.path.join(notebook_dir, "output")
-    os.makedirs(figures_dir, exist_ok=True)
-
-    pdf_path = os.path.join(figures_dir, f"{output_prefix}.pdf")
-    png_path = os.path.join(figures_dir, f"{output_prefix}.png")
-
-    plt.savefig(pdf_path, bbox_inches="tight")
-    plt.savefig(png_path, bbox_inches="tight", dpi=300)
-    plt.show()
-
-    return df
+    # Normalised form. Each row is divided by its own max |delta|, which fixes the
+    # within-row scale but does not make split gain and permutation importance
+    # commensurate -- hence the family blocks and the note under the figure.
+    _disp = {display_names.get(m.lower(), m): model_family(m) for m in ordered_models}
+    return _family_block_heatmap(
+        df_cat, df_non_cat, _disp, cmap=_shift_cmap(), vmin=-1.0, vmax=1.0, center=0,
+        cbar_ticks=[-1.0, 0.0, 1.0], cbar_ticklabels=["\u22121\nrandom", "0", "+1\ntemporal"],
+        cbar_label="Shift within row, \u0394 / max |\u0394|", title=title,
+        note=("\u0394 = temporal \u2212 random share of each model's total importance, "
+              "scaled by that row's largest |\u0394|: colour compares features within a "
+              "row, not magnitudes between rows.\n" + _ATTRIBUTION_NOTE),
+        output_prefix=output_prefix)
 
 
 # ---- Feature-matrix standardisation ----------------------------------------
@@ -3045,79 +2586,273 @@ def standardize_targets(cols, first):
         out.append(j)
     return out
 
+# ---- Paper tables -----------------------------------------------------------------
 
-def standardize_matrices(data_root=None, matrices=None, sample_step=50,
-                         chunk_rows=8_000_000, dry_run=False, force=False,
-                         verbose=True):
-    """Standardise trailing/running columns of the saved matrices, in place.
+_E3_TABLE_MODELS = [
+    ("xgboost", r"XGBoost~\cite{chen_xgboost_2016}"),
+    ("lightgbm", r"LightGBM~\cite{ke_lightgbm}"),
+    ("catboost", r"CatBoost~\cite{catboost}"),
+    ("mlp", "MLP"),
+    ("ft", r"FT-Transformer~\cite{ft_transformer}"),
+    ("tabnet", r"TabNet~\cite{arik_tabnet_2021}"),
+    ("saint", r"SAINT~\cite{saint}"),
+    ("tsmixer", r"TSMixer~\cite{chen_tsmixer_2023}"),
+]
+# ROC-AUC once -- it is identical with either class as positive -- then PR-AUC per
+# class, which is what separates models that catch hardware faults from payload ones.
+_E3_TABLE_COLUMNS = [("roc_auc", r"\textbf{ROC-AUC}"),
+                     ("hardware.pr_auc", r"\textbf{Hardware PR-AUC}"),
+                     ("payload.pr_auc", r"\textbf{Payload PR-AUC}")]
 
-    Mean and sd come from pre-cutoff training rows only (via splits.npz), so the
-    scaler never sees the test period. The applied values are recorded under the
-    SCALERS key of schema_meta.json, which also makes this idempotent: a matrix whose
-    scalers are already recorded is skipped unless `force` is set.
 
-    Do not run this while a training job has the matrices memory-mapped -- the job
-    would read half-rescaled data. Returns the scaler dict.
+def e3_results_table(results_path=None, out_path=None):
+    """LaTeX table of E3 (fault attribution) results, Random vs Temporal per column.
+
+    Mean +/- sample SD over the seeded runs (`<split>__seed<n>`); a plain `<split>`
+    key is an older single run and is ignored. Best value per column in bold. Writes
+    `out_path` when given and returns the LaTeX either way.
     """
-    root = data_root or DATA_ROOT
-    meta_path = os.path.join(root, "schema_meta.json")
-    with open(meta_path) as fh:
-        meta = json.load(fh)
-    splits = np.load(os.path.join(root, "splits.npz"))
-    recorded = meta.get("SCALERS") or {}
-    if recorded and not force:
-        if verbose:
-            print(f"schema_meta.json already records {len(recorded)} scalers; "
-                  f"nothing to do (pass force=True to re-apply).")
-        return recorded
+    if results_path is None:
+        results_path = os.path.join(RESULTS_DIR, "fault_attr_results.json")
+    with open(results_path) as fh:
+        results = json.load(fh)
+    splits = ("random", "temporal")
 
-    scalers = dict(recorded) if force else {}
-    for name in (matrices or sorted(_STD_MATRICES)):
-        spec = _STD_MATRICES[name]
-        path = os.path.join(root, f"{name}.npy")
-        if not os.path.exists(path):
-            if verbose:
-                print(f"[skip] {path} not found")
-            continue
-        cols, ncat = meta[spec["cols"]], meta[spec["ncat"]]
-        M = np.load(path, mmap_mode="r" if dry_run else "r+")
-        if M.shape[1] != len(cols):
-            if verbose:
-                print(f"[skip] {name}: matrix has {M.shape[1]} columns but schema "
-                      f"lists {len(cols)} -- regenerate before patching")
-            continue
-        fit_rows = splits[spec["split"]][::sample_step]
-        todo = standardize_targets(cols, ncat)
-        if verbose:
-            print(f"\n{name} {M.shape}: {len(todo)} column(s) on "
-                  f"{len(fit_rows):,} pre-cutoff rows")
-        for j in todo:
-            col = np.asarray(M[fit_rows, j], dtype=np.float64)
-            mu = float(np.nanmean(col))
-            sd = float(np.nanstd(col)) or 1.0
-            if verbose:
-                print(f"  {cols[j]:34s} mean {mu:10.4f}  sd {sd:9.4f}"
-                      f"{'   (dry run)' if dry_run else ''}")
-            if dry_run:
-                continue
-            for a in range(0, M.shape[0], chunk_rows):
-                b = min(a + chunk_rows, M.shape[0])
-                M[a:b, j] = (M[a:b, j] - mu) / sd
-            scalers[cols[j]] = {"mean": mu, "sd": sd}
-        if not dry_run:
-            M.flush()
-        del M
+    def _get(run, path):
+        for p in path.split("."):
+            run = run[p]
+        return float(run)
 
-    if dry_run:
-        if verbose:
-            print("\nDry run: nothing written.")
-        return scalers
+    stats = {}
+    for mk, _ in _E3_TABLE_MODELS:
+        for split in splits:
+            runs = [v for k, v in results[mk].items() if k.startswith(split + "__seed")]
+            if len(runs) < 2:
+                raise ValueError(f"{mk}/{split}: {len(runs)} seeded run(s); need >= 2")
+            for key, _ in _E3_TABLE_COLUMNS:
+                x = np.array([_get(r, key) for r in runs])
+                stats[mk, split, key] = (x.mean(), x.std(ddof=1))
+    best = {(s, key): max(round(stats[mk, s, key][0], 3) for mk, _ in _E3_TABLE_MODELS)
+            for s in splits for key, _ in _E3_TABLE_COLUMNS}
 
-    meta["SCALERS"] = scalers
-    tmp = meta_path + ".partial"
-    with open(tmp, "w") as fh:
-        json.dump(meta, fh, indent=2)
-    os.replace(tmp, meta_path)
-    if verbose:
-        print(f"\nRecorded {len(scalers)} scalers in {meta_path}")
-    return scalers
+    def _cell(mk, s, key):
+        mu, sd = stats[mk, s, key]
+        txt = f"{mu:.3f} \\pm {sd:.3f}"
+        return f"$\\mathbf{{{txt}}}$" if round(mu, 3) == best[s, key] else f"${txt}$"
+
+    ncol = len(_E3_TABLE_COLUMNS)
+    w = max(len(n) for _, n in _E3_TABLE_MODELS)
+    lines = [
+        r"\begin{table*}[ht]", r"\centering",
+        r"\caption{Fault attribution performance ($\text{Mean} \pm \text{Std}$, 3 seeds) "
+        r"on the Random and Temporal splits.}",
+        r"\setlength{\tabcolsep}{3.5pt}",
+        r"\begin{tabular}{l" + "c" * (2 * ncol) + "}", r"\hline",
+        "& " + " & ".join(f"\\multicolumn{{2}}{{c}}{{$\\uparrow$ {lab}}}"
+                          for _, lab in _E3_TABLE_COLUMNS) + r" \\",
+        " ".join(f"\\cline{{{2 + 2 * i}-{3 + 2 * i}}}" for i in range(ncol)),
+        r"\textbf{Model} & " + " & ".join([r"\textbf{Random} & \textbf{Temporal}"] * ncol)
+        + r" \\",
+        r"\hline",
+    ]
+    for mk, name in _E3_TABLE_MODELS:
+        lines.append(f"{name:<{w}} & " + " & ".join(
+            _cell(mk, s, key) for key, _ in _E3_TABLE_COLUMNS for s in splits) + r" \\")
+    lines += [r"\hline", r"\end{tabular}", r"\label{tab:results_hw_fault}", r"\end{table*}"]
+    tex = "\n".join(lines) + "\n"
+    if out_path is not None:
+        with open(out_path, "w") as fh:
+            fh.write(tex)
+    return tex
+
+
+# ---- Protocol significance on the shared out-of-time slice -------------------------
+
+def _oot_metrics(y, p, thr, thr_neg, per_class):
+    """Metrics for one arm on one (resampled) set of rows, at that arm's own cuts."""
+    def _f1(y_pos, pred_pos):
+        tp = np.count_nonzero(y_pos & pred_pos)
+        fp = np.count_nonzero(~y_pos & pred_pos)
+        fn = np.count_nonzero(y_pos & ~pred_pos)
+        return 2 * tp / (2 * tp + fp + fn) if tp else 0.0
+    def _mcc(pred_pos):
+        # At the positive-class cut, as the harness stores it.
+        tp = float(np.count_nonzero(yb & pred_pos)); fp = float(np.count_nonzero(~yb & pred_pos))
+        fn = float(np.count_nonzero(yb & ~pred_pos)); tn = float(len(yb)) - tp - fp - fn
+        den = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+        return (tp * tn - fp * fn) / den if den > 0 else 0.0
+    yb = y.astype(bool)
+    out = {"roc_auc": roc_auc_score(y, p), "mcc": _mcc(p >= thr)}
+    if per_class:
+        out["hardware.pr_auc"] = average_precision_score(y, p)
+        out["payload.pr_auc"] = average_precision_score(1 - y, 1.0 - p)
+        out["hardware.f1"] = _f1(yb, p >= thr)
+        out["payload.f1"] = _f1(~yb, p < thr_neg)
+    else:
+        out["pr_auc"] = average_precision_score(y, p)
+        out["f1"] = _f1(yb, p >= thr)
+    return out
+
+
+def _oot_boot_one(experiment, lib, seed, n_boot, boot_seed, results):
+    """Bootstrap (temporal - random) per metric for one model and seed. The resample
+    indices depend only on `boot_seed` and the replicate number, so every seed and
+    model sees the same resamples and the per-seed differences can be averaged."""
+    exp_tag = "e3_fault" if experiment == "e3" else experiment
+    per_class = experiment == "e3"
+    arms = {}
+    for arm in ("random", "temporal"):
+        idx, p = load_predictions(exp_tag, lib, f"{arm}__oot", seed=seed, calibrated=False)
+        run = results[lib][f"{arm}__seed{seed}"]
+        thr = run["hardware"]["threshold"] if per_class else run["threshold"]
+        thr_neg = run["payload"]["threshold"] if per_class else None
+        arms[arm] = (np.asarray(idx), np.asarray(p, dtype=np.float64), thr, thr_neg)
+    if not np.array_equal(arms["random"][0], arms["temporal"][0]):
+        raise ValueError(f"{lib} seed {seed}: the arms' OOT predictions cover different rows")
+    idx = arms["random"][0]
+    if per_class:
+        keep = np.asarray(np.load(os.path.join(DATA_ROOT, "failed.npy"), mmap_mode="r")[idx]) == 1
+        y = np.asarray(np.load(os.path.join(DATA_ROOT, "hw.npy"), mmap_mode="r")[idx])[keep].astype(np.int8)
+    else:
+        keep = np.ones(len(idx), dtype=bool)
+        y = np.asarray(np.load(os.path.join(DATA_ROOT, "failed.npy"), mmap_mode="r")[idx]).astype(np.int8)
+    pr, pt = arms["random"][1][keep], arms["temporal"][1][keep]
+
+    def _delta(sel):
+        a = _oot_metrics(y[sel], pt[sel], *arms["temporal"][2:], per_class)
+        b = _oot_metrics(y[sel], pr[sel], *arms["random"][2:], per_class)
+        return {k: a[k] - b[k] for k in a}, a, b
+
+    obs, obs_t, obs_r = _delta(slice(None))
+    boots = {k: np.empty(n_boot) for k in obs}
+    n = len(y)
+    for b in range(n_boot):
+        sel = np.random.default_rng([boot_seed, b]).integers(0, n, n)
+        d, _, _ = _delta(sel)
+        for k, v in d.items():
+            boots[k][b] = v
+    return lib, seed, obs, obs_t, obs_r, boots
+
+
+def oot_protocol_significance(experiment="e3", models=None, seeds=(0, 1, 2),
+                              n_boot=1000, boot_seed=0, n_jobs=-1, results_path=None):
+    """Paired bootstrap test of Temporal-OOT vs Random-OOT on the shared OOT slice.
+
+    Both arms' saved predictions on the identical out-of-time rows are resampled
+    together (same rows for both arms, every seed and every model), each metric is
+    recomputed per arm at that arm's own tuned threshold, and the temporal-minus-random
+    difference is averaged over seeds. Reported per model and metric: the observed
+    mean difference, its 95% percentile interval, a two-sided bootstrap p-value, the
+    Holm-adjusted p across models within each metric, and how many seeds agree in sign.
+
+    The interval reflects test-set sampling only; seed-to-seed variation enters via the
+    average and the sign count, not the interval. E3 metrics are computed on failed
+    jobs only, as in the harness.
+    """
+    from joblib import Parallel, delayed
+    fname = {"e1": "protocol_eval_results.json", "e3": "fault_attr_results.json"}[experiment]
+    with open(results_path or os.path.join(RESULTS_DIR, fname)) as fh:
+        results = json.load(fh)
+    models = models or [m for m in PREFERRED_MODEL_ORDER if m in results]
+    jobs = Parallel(n_jobs=n_jobs)(
+        delayed(_oot_boot_one)(experiment, m, s, n_boot, boot_seed, results)
+        for m in models for s in seeds)
+
+    rows = []
+    for m in models:
+        per = [j for j in jobs if j[0] == m]
+        for k in per[0][2]:
+            obs = np.mean([j[2][k] for j in per])
+            dist = np.mean([j[5][k] for j in per], axis=0)
+            p = 2 * min((dist <= 0).mean(), (dist >= 0).mean())
+            rows.append({
+                "model": MODEL_DISPLAY_NAMES.get(m, m), "metric": k,
+                "random": np.mean([j[4][k] for j in per]),
+                "temporal": np.mean([j[3][k] for j in per]),
+                "delta": obs, "ci_lo": np.percentile(dist, 2.5),
+                "ci_hi": np.percentile(dist, 97.5),
+                "p": max(p, 1.0 / n_boot),
+                "seeds_agree": f"{sum(np.sign(j[2][k]) == np.sign(obs) for j in per)}/{len(per)}",
+            })
+    df = pd.DataFrame(rows)
+    # Holm step-down within each metric, across the models compared.
+    df["p_holm"] = np.nan
+    for _, g in df.groupby("metric"):
+        order = g["p"].sort_values().index
+        m_ = len(order)
+        running = 0.0
+        for rank, ix in enumerate(order):
+            running = max(running, min(1.0, (m_ - rank) * df.at[ix, "p"]))
+            df.at[ix, "p_holm"] = running
+    return df
+
+
+def oot_campaign_split_report(experiment="e3", models=None, seeds=(0, 1, 2),
+                              results_path=None):
+    """Score both arms' saved OOT predictions separately by campaign familiarity.
+
+    August jobs fall into three groups: a POMS campaign that also has jobs in the
+    training window ("seen"), a campaign with none ("unseen" -- nothing about it could
+    have been memorised), and user jobs with no campaign ("user"; their batch id is not
+    in the matrices, so familiarity cannot be decided). "Seen" is judged against the
+    training window both arms share (window minus the random arm's test set). Each arm
+    is scored at its own tuned threshold, mean over seeds. No retraining.
+    """
+    from eval.dataset import load_experiment
+    fname = {"e1": "protocol_eval_results.json", "e3": "fault_attr_results.json"}[experiment]
+    with open(results_path or os.path.join(RESULTS_DIR, fname)) as fh:
+        results = json.load(fh)
+    models = models or [m for m in PREFERRED_MODEL_ORDER if m in results]
+    exp_tag = "e3_fault" if experiment == "e3" else experiment
+    per_class = experiment == "e3"
+
+    d = load_experiment(experiment)
+    cols = d.xmatch_cols
+    cn, ct = cols.index("CampaignName"), cols.index("CampaignType")
+    user_code = int(next(k for k, v in d.schema["CAMPAIGN_TYPE_CODES"].items() if v == "User"))
+    tr = d.train("temporal")
+    tr_c = np.asarray(d.Xmatch[tr][:, [cn, ct]]).astype(np.int64)
+    seen_campaigns = np.unique(tr_c[tr_c[:, 1] != user_code, 0])
+    failed = np.load(os.path.join(DATA_ROOT, "failed.npy"), mmap_mode="r")
+    hw = np.load(os.path.join(DATA_ROOT, "hw.npy"), mmap_mode="r")
+
+    rows, groups_cache = [], {}
+    for m in models:
+        for arm in ("random", "temporal"):
+            acc = {}
+            for seed in seeds:
+                idx, p = load_predictions(exp_tag, m, f"{arm}__oot", seed=seed,
+                                          calibrated=False)
+                idx = np.asarray(idx)
+                key = idx.tobytes()[:64] + bytes(str(len(idx)), "ascii")
+                if key not in groups_cache:
+                    c = np.asarray(d.Xmatch[idx][:, [cn, ct]]).astype(np.int64)
+                    user = c[:, 1] == user_code
+                    seen = ~user & np.isin(c[:, 0], seen_campaigns)
+                    groups_cache[key] = {"all": np.ones(len(idx), bool), "seen": seen,
+                                         "unseen": ~user & ~seen, "user": user}
+                grp = groups_cache[key]
+                run = results[m][f"{arm}__seed{seed}"]
+                thr = run["hardware"]["threshold"] if per_class else run["threshold"]
+                thr_neg = run["payload"]["threshold"] if per_class else None
+                if per_class:
+                    keep = np.asarray(failed[idx]) == 1
+                    y = np.asarray(hw[idx]).astype(np.int8)
+                else:
+                    keep = np.ones(len(idx), bool)
+                    y = np.asarray(failed[idx]).astype(np.int8)
+                p = np.asarray(p, dtype=np.float64)
+                for g, gm in grp.items():
+                    sel = gm & keep
+                    if sel.sum() == 0 or len(np.unique(y[sel])) < 2:
+                        continue
+                    mm = _oot_metrics(y[sel], p[sel], thr, thr_neg, per_class)
+                    mm["n"] = int(sel.sum())
+                    mm["positive_rate"] = float(y[sel].mean())
+                    for k, v in mm.items():
+                        acc.setdefault((g, k), []).append(v)
+            for (g, k), vals in acc.items():
+                rows.append({"model": MODEL_DISPLAY_NAMES.get(m, m), "arm": arm, "group": g,
+                             "metric": k, "mean": float(np.mean(vals)),
+                             "sd": float(np.std(vals, ddof=1)) if len(vals) > 1 else float("nan")})
+    return pd.DataFrame(rows)
