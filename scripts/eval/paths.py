@@ -80,9 +80,7 @@ def _resolve(env_var, key):
         or _DEFAULTS[key])
 
 
-# Results are tracked in git, unlike the data and model roots, so they live in the
-# repository at a fixed location. Deliberately not configurable and not relative to
-# the working directory: a run started from anywhere must update the same file.
+# One file per experiment and model: results/<experiment>/<model>.json.
 RESULTS_DIR = os.path.join(_SCRIPTS, "results")
 
 DATA_ROOT = _resolve("FIFE_DATA_ROOT", "data_root")

@@ -103,28 +103,33 @@ def _wb_start(experiment, model, split, seed, **extra):
 
 
 def save_experiment_results(exp_name, lib, got_metrics, output_dir=None):
-    """Loads existing experiment JSON, updates the entries for the model, and saves back to disk."""
-    output_dir = output_dir if output_dir is not None else RESULTS_DIR
-    os.makedirs(output_dir, exist_ok=True)
-    json_path = os.path.join(output_dir, f"{exp_name}_results.json")
+    """Merge one model's runs into <output_dir>/<exp_name>/<lib>.json.
 
-    data = {}
-    if os.path.exists(json_path) and os.path.getsize(json_path) > 0:
-        try:
+    One file per experiment and model, so different models never touch the same file.
+    The update is still locked and written atomically (temporary file, then rename),
+    because several seed runs of one model can finish together; an unreadable file
+    raises rather than being treated as empty.
+    """
+    import fcntl
+    import tempfile
+
+    output_dir = os.path.join(output_dir if output_dir is not None else RESULTS_DIR, exp_name)
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir, f"{lib}.json")
+
+    with open(json_path + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = {}
+        if os.path.exists(json_path) and os.path.getsize(json_path) > 0:
             with open(json_path, "r") as f:
                 data = json.load(f)
-        except json.JSONDecodeError:
-            data = {}
+        data.update(got_metrics)
+        fd, tmp = tempfile.mkstemp(dir=output_dir, prefix=f".{lib}_", suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=4)
+        os.replace(tmp, json_path)
 
-    # Merge new split metrics for this model library
-    if lib not in data:
-        data[lib] = {}
-    data[lib].update(got_metrics)
-
-    with open(json_path, "w") as f:
-        json.dump(data, f, indent=4)
-
-    print(f"[{exp_name.upper()}] Appended results for model '{lib}' to {json_path}", flush=True)
+    print(f"[{exp_name.upper()}] Saved results for model '{lib}' to {json_path}", flush=True)
 
 def fit_eval_binary(
     lib, parts, tri, tei, trs, yv, spw, want_imp=False, ncat=None, split=None, exp_tag=None,

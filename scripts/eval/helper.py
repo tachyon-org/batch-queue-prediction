@@ -614,6 +614,23 @@ def aggregate_seeds(runs, keys=None):
     return agg
 
 
+RESULT_NAMES = {"e1": "protocol_eval", "e2": "wait_time", "e3": "fault_attr"}
+
+
+def load_results(name, results_dir=None):
+    """{model: {"<split>__seed<n>": metrics, ...}} for one experiment, gathered from
+    results/<name>/<model>.json. `name` is the results name ("protocol_eval",
+    "wait_time", "fault_attr") or the experiment ("e1", "e2", "e3")."""
+    import glob as _glob
+    name = RESULT_NAMES.get(name, name)
+    folder = os.path.join(results_dir if results_dir is not None else RESULTS_DIR, name)
+    out = {}
+    for path in sorted(_glob.glob(os.path.join(folder, "*.json"))):
+        with open(path) as fh:
+            out[os.path.splitext(os.path.basename(path))[0]] = json.load(fh)
+    return out
+
+
 def collect_seed_runs(exp_name, lib, split, results_dir=None):
     """Gather every seed's metrics for one model/split out of a results JSON.
 
@@ -621,11 +638,7 @@ def collect_seed_runs(exp_name, lib, split, results_dir=None):
     "<split>__seed<N>" (the rest), so this pulls them back together for
     `aggregate_seeds`.
     """
-    results_dir = results_dir if results_dir is not None else RESULTS_DIR
-    path = os.path.join(results_dir, f"{exp_name}_results.json")
-    with open(path) as f:
-        data = json.load(f)
-    entry = data.get(lib, {})
+    entry = load_results(exp_name, results_dir).get(lib, {})
     runs = [v for k, v in entry.items() if k == split or k.startswith(f"{split}__seed")]
     return runs
 
@@ -1479,9 +1492,11 @@ def _instantiate_pytorch_model(m_name, n_feats, state_dict=None):
     return None
 
 def compute_permutation_importance(
-    model, X_eval, y_eval, device="cuda", batch_size=32768, sample_size=None
+    model, X_eval, y_eval, device="cuda", batch_size=32768, sample_size=None, kind="bin"
 ):
-    """Computes Permutation Feature Importance (% ROC-AUC drop) for PyTorch DL models.
+    """Computes Permutation Feature Importance for PyTorch DL models: the drop in ROC-AUC
+    for a classifier (kind="bin"), or in R^2 on the model's own target scale -- log1p
+    wait for E2 -- for a regressor (kind="reg", raw outputs, no sigmoid).
 
     Uses 100% of X_eval if sample_size is None or if len(X_eval) <= sample_size.
     """
@@ -1504,11 +1519,13 @@ def compute_permutation_importance(
                     out = out.logits
                 if out.ndim > 1:
                     out = out.squeeze(-1)
-                preds.append(torch.sigmoid(out.float()).cpu().numpy())
+                out = out.float() if kind == "reg" else torch.sigmoid(out.float())
+                preds.append(out.cpu().numpy())
         return np.concatenate(preds)
 
+    _score = r2_score if kind == "reg" else roc_auc_score
     base_preds = _predict(X_sub)
-    base_auc = roc_auc_score(y_sub, base_preds)
+    base_auc = _score(y_sub, base_preds)
 
     n_features = X_sub.shape[1]
     importance_scores = np.zeros(n_features)
@@ -1518,7 +1535,7 @@ def compute_permutation_importance(
         np.random.shuffle(X_perm[:, f_idx])
 
         perm_preds = _predict(X_perm)
-        perm_auc = roc_auc_score(y_sub, perm_preds)
+        perm_auc = _score(y_sub, perm_preds)
 
         importance_scores[f_idx] = max(0.0, base_auc - perm_auc)
 
@@ -1529,8 +1546,9 @@ def compute_permutation_importance(
     return importance_scores
 
 
-def extract_tree_importance(model_name, file_path, n_feats):
-    """Loads saved decision tree models and extracts normalized feature gain importances (summing to 1.0)."""
+def extract_tree_importance(model_name, file_path, n_feats, kind="bin"):
+    """Loads saved decision tree models and extracts normalized feature gain importances
+    (summing to 1.0). kind="reg" loads the E2 regressors."""
     m_name = model_name.lower()
 
     if m_name in ("lightgbm", "lgb"):
@@ -1540,16 +1558,16 @@ def extract_tree_importance(model_name, file_path, n_feats):
         imp = bst.feature_importance(importance_type="gain")
 
     elif m_name in ("catboost", "cat"):
-        from catboost import CatBoostClassifier
+        from catboost import CatBoostClassifier, CatBoostRegressor
 
-        cb = CatBoostClassifier()
+        cb = CatBoostRegressor() if kind == "reg" else CatBoostClassifier()
         cb.load_model(file_path)
         imp = cb.get_feature_importance()
 
     elif m_name in ("xgboost", "xgb"):
         import xgboost as xgb
 
-        m = xgb.XGBClassifier()
+        m = xgb.XGBRegressor() if kind == "reg" else xgb.XGBClassifier()
         m.load_model(file_path)
         imp = m.feature_importances_
 
@@ -1678,8 +1696,13 @@ def load_saved_importances(
     y_eval=None,
     exp_tag="bin_e1",
     device=None,
+    kind="bin",
 ):
     """Scans directories, loads saved Tree, TabNet, and PyTorch DL models, and returns.
+
+    `kind="reg"` is for the E2 wait-time regressors: trees load as regressors, TabNet as
+    a TabNetRegressor, and permutation importance is the drop in R^2 on `y_eval`, which
+    must then be on the models' target scale (log1p wait seconds).
 
     an imp_dict keyed by (model, split) with normalized importances.
 
@@ -1734,7 +1757,7 @@ def load_saved_importances(
             if m_lower in ("xgboost", "xgb", "lightgbm", "lgb", "catboost", "cat"):
                 try:
                     imp_dict[(m, split)] = extract_tree_importance(
-                        m_lower, matched_path, n_feats
+                        m_lower, matched_path, n_feats, kind=kind
                     )
                     print(f"[Loaded Tree Model] {m:10s} ({split:8s}) <- {matched_path}")
                 except Exception as e:
@@ -1742,9 +1765,9 @@ def load_saved_importances(
 
             elif m_lower == "tabnet":
                 try:
-                    from pytorch_tabnet.tab_model import TabNetClassifier
+                    from pytorch_tabnet.tab_model import TabNetClassifier, TabNetRegressor
 
-                    clf = TabNetClassifier()
+                    clf = TabNetRegressor() if kind == "reg" else TabNetClassifier()
                     clf.load_model(matched_path)
 
                     if X_eval is not None:
@@ -1787,7 +1810,7 @@ def load_saved_importances(
                         net.load_state_dict(state_dict)
 
                     imp = compute_permutation_importance(
-                        net, X_eval, y_eval, device=device
+                        net, X_eval, y_eval, device=device, kind=kind
                     )
                     imp_dict[(m, split)] = imp
                     print(f"[Computed Permutation Imp] {m:10s} ({split:8s}) on {device}")
@@ -2612,10 +2635,7 @@ def e3_results_table(results_path=None, out_path=None):
     key is an older single run and is ignored. Best value per column in bold. Writes
     `out_path` when given and returns the LaTeX either way.
     """
-    if results_path is None:
-        results_path = os.path.join(RESULTS_DIR, "fault_attr_results.json")
-    with open(results_path) as fh:
-        results = json.load(fh)
+    results = load_results("fault_attr", results_path)
     splits = ("random", "temporal")
 
     def _get(run, path):
@@ -2694,7 +2714,66 @@ def _oot_metrics(y, p, thr, thr_neg, per_class):
     return out
 
 
-def _oot_boot_one(experiment, lib, seed, n_boot, boot_seed, results):
+def _wboot_metrics(W, y, p, thr, thr_neg, per_class):
+    """The metrics of `_oot_metrics` for a batch of bootstrap replicates at once.
+
+    `W` is a (B, n) tensor of resample counts (row i drawn W[b, i] times in replicate
+    b); `y` (n,) 0/1 labels and `p` (n,) float64 scores, on the same device. ROC-AUC
+    and average precision follow scikit-learn's definitions -- equal scores form one
+    threshold, ties count half in the AUC -- computed from cumulative weighted sums
+    over one sort, so no replicate re-sorts. Returns {metric: (B,) float64 tensor}.
+    """
+    import torch
+    yf = y.to(torch.float32)
+
+    def _auc_ap(yv, sv):
+        order = torch.argsort(sv, descending=True)
+        s_, ys, Ws = sv[order], yv[order], W[:, order]
+        last = torch.ones_like(s_, dtype=torch.bool)
+        last[:-1] = s_[1:] != s_[:-1]                      # last row of each tie group
+        tp = torch.cumsum(Ws * ys, 1)[:, last].double()
+        fp = torch.cumsum(Ws * (1 - ys), 1)[:, last].double()
+        P, N = tp[:, -1], fp[:, -1]
+        z = torch.zeros_like(tp[:, :1])
+        dtp = torch.diff(tp, dim=1, prepend=z)
+        dfp = torch.diff(fp, dim=1, prepend=z)
+        auc = (dtp * (N[:, None] - fp) + 0.5 * dtp * dfp).sum(1) / (P * N)
+        ap = (dtp * tp / (tp + fp).clamp_min(1e-12)).sum(1) / P
+        return auc, ap
+
+    def _counts(pos, pred):
+        pos, pred = pos.to(torch.float32), pred.to(torch.float32)
+        tp = (W @ (pos * pred)).double()
+        fp = (W @ ((1 - pos) * pred)).double()
+        fn = (W @ (pos * (1 - pred))).double()
+        tn = W.sum(1).double() - tp - fp - fn
+        return tp, fp, fn, tn
+
+    def _f1(tp, fp, fn):
+        den = 2 * tp + fp + fn
+        return torch.where(tp > 0, 2 * tp / den.clamp_min(1e-12), torch.zeros_like(tp))
+
+    def _mcc(tp, fp, fn, tn):
+        den = torch.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+        return torch.where(den > 0, (tp * tn - fp * fn) / den.clamp_min(1e-12),
+                           torch.zeros_like(tp))
+
+    auc, ap = _auc_ap(yf, p)
+    tp, fp, fn, tn = _counts(yf, p >= thr)
+    out = {"roc_auc": auc, "mcc": _mcc(tp, fp, fn, tn)}
+    if per_class:
+        out["hardware.pr_auc"] = ap
+        out["payload.pr_auc"] = _auc_ap(1 - yf, -p)[1]
+        out["hardware.f1"] = _f1(tp, fp, fn)
+        ptp, pfp, pfn, _ = _counts(1 - yf, p < thr_neg)
+        out["payload.f1"] = _f1(ptp, pfp, pfn)
+    else:
+        out["pr_auc"] = ap
+        out["f1"] = _f1(tp, fp, fn)
+    return out
+
+
+def _oot_boot_one(experiment, lib, seed, n_boot, boot_seed, results, device=None):
     """Bootstrap (temporal - random) per metric for one model and seed. The resample
     indices depend only on `boot_seed` and the replicate number, so every seed and
     model sees the same resamples and the per-seed differences can be averaged."""
@@ -2726,6 +2805,29 @@ def _oot_boot_one(experiment, lib, seed, n_boot, boot_seed, results):
     obs, obs_t, obs_r = _delta(slice(None))
     boots = {k: np.empty(n_boot) for k in obs}
     n = len(y)
+    if device is not None:
+        # Poisson bootstrap on `device`: each row's resample count is Poisson(1), drawn
+        # from a generator seeded by (boot_seed, batch start), so every model and seed
+        # sees the same replicates. Batch size keeps the (B, n) work under ~4 GB.
+        import torch
+        dev = torch.device(device)
+        yt = torch.as_tensor(y, device=dev)
+        st = torch.as_tensor(pt, dtype=torch.float64, device=dev)
+        sr = torch.as_tensor(pr, dtype=torch.float64, device=dev)
+        bsz = max(1, min(n_boot, int(4e9 // (n * 4 * 10))))
+        for start in range(0, n_boot, bsz):
+            b = min(bsz, n_boot - start)
+            g = torch.Generator(device=dev)
+            g.manual_seed(int(boot_seed) * 1_000_003 + start)
+            W = torch.poisson(torch.ones((b, n), device=dev), generator=g)
+            mt = _wboot_metrics(W, yt, st, *arms["temporal"][2:], per_class)
+            mr = _wboot_metrics(W, yt, sr, *arms["random"][2:], per_class)
+            for k in boots:
+                boots[k][start:start + b] = (mt[k] - mr[k]).cpu().numpy()
+            del W, mt, mr
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+        return lib, seed, obs, obs_t, obs_r, boots
     for b in range(n_boot):
         sel = np.random.default_rng([boot_seed, b]).integers(0, n, n)
         d, _, _ = _delta(sel)
@@ -2734,8 +2836,31 @@ def _oot_boot_one(experiment, lib, seed, n_boot, boot_seed, results):
     return lib, seed, obs, obs_t, obs_r, boots
 
 
+def _least_busy_gpu():
+    """'cuda:<i>' for the least-utilised GPU (most free memory breaks ties), or None
+    without CUDA. Utilisation comes from nvidia-smi; when CUDA_VISIBLE_DEVICES remaps
+    the indices, or nvidia-smi is unavailable, free memory alone decides."""
+    if not torch.cuda.is_available():
+        return None
+    n = torch.cuda.device_count()
+    free = [torch.cuda.mem_get_info(i)[0] for i in range(n)]
+    util = [0] * n
+    if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+        try:
+            import subprocess
+            out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu",
+                                  "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=10).stdout.split()
+            if len(out) == n:
+                util = [int(u) for u in out]
+        except Exception:                     # noqa: BLE001 - fall back to memory only
+            pass
+    return f"cuda:{min(range(n), key=lambda i: (util[i], -free[i]))}"
+
+
 def oot_protocol_significance(experiment="e3", models=None, seeds=(0, 1, 2),
-                              n_boot=1000, boot_seed=0, n_jobs=-1, results_path=None):
+                              n_boot=1000, boot_seed=0, n_jobs=-1, results_path=None,
+                              device="auto"):
     """Paired bootstrap test of Temporal-OOT vs Random-OOT on the shared OOT slice.
 
     Both arms' saved predictions on the identical out-of-time rows are resampled
@@ -2745,18 +2870,41 @@ def oot_protocol_significance(experiment="e3", models=None, seeds=(0, 1, 2),
     mean difference, its 95% percentile interval, a two-sided bootstrap p-value, the
     Holm-adjusted p across models within each metric, and how many seeds agree in sign.
 
+    On a GPU (the default when one is free) the resampling is a Poisson bootstrap --
+    each row's count drawn from Poisson(1) -- computed in batches from one sort per
+    model; `device="cpu"` keeps the per-replicate scikit-learn path.
+
     The interval reflects test-set sampling only; seed-to-seed variation enters via the
     average and the sign count, not the interval. E3 metrics are computed on failed
     jobs only, as in the harness.
     """
     from joblib import Parallel, delayed
-    fname = {"e1": "protocol_eval_results.json", "e3": "fault_attr_results.json"}[experiment]
-    with open(results_path or os.path.join(RESULTS_DIR, fname)) as fh:
-        results = json.load(fh)
+    results = load_results(experiment, results_path)
     models = models or [m for m in PREFERRED_MODEL_ORDER if m in results]
-    jobs = Parallel(n_jobs=n_jobs)(
-        delayed(_oot_boot_one)(experiment, m, s, n_boot, boot_seed, results)
-        for m in models for s in seeds)
+    # Per model, only the seeds both arms have finished: a model still running (or a
+    # seed that was skipped) contributes what exists rather than failing the whole run.
+    pairs = [(m, s) for m in models for s in seeds
+             if f"random__seed{s}" in results.get(m, {})
+             and f"temporal__seed{s}" in results.get(m, {})]
+    missing = sorted({m for m in models} - {m for m, _ in pairs})
+    if missing:
+        print(f"[significance] no seed with both arms for: {', '.join(missing)}")
+    models = [m for m in models if m not in missing]
+    # device="auto": the GPU with the most free memory if there is one (batched
+    # Poisson bootstrap, one model/seed at a time), else the CPU path. device="cpu"
+    # forces the original per-replicate scikit-learn path across `n_jobs` processes.
+    if device == "auto":
+        device = _least_busy_gpu()
+    elif device == "cpu":
+        device = None
+    if device is not None:
+        print(f"[significance] Poisson bootstrap on {device}", flush=True)
+        jobs = [_oot_boot_one(experiment, m, s, n_boot, boot_seed, results, device=device)
+                for m, s in pairs]
+    else:
+        jobs = Parallel(n_jobs=n_jobs)(
+            delayed(_oot_boot_one)(experiment, m, s, n_boot, boot_seed, results)
+            for m, s in pairs)
 
     rows = []
     for m in models:
@@ -2799,9 +2947,7 @@ def oot_campaign_split_report(experiment="e3", models=None, seeds=(0, 1, 2),
     is scored at its own tuned threshold, mean over seeds. No retraining.
     """
     from eval.dataset import load_experiment
-    fname = {"e1": "protocol_eval_results.json", "e3": "fault_attr_results.json"}[experiment]
-    with open(results_path or os.path.join(RESULTS_DIR, fname)) as fh:
-        results = json.load(fh)
+    results = load_results(experiment, results_path)
     models = models or [m for m in PREFERRED_MODEL_ORDER if m in results]
     exp_tag = "e3_fault" if experiment == "e3" else experiment
     per_class = experiment == "e3"
@@ -2856,3 +3002,4 @@ def oot_campaign_split_report(experiment="e3", models=None, seeds=(0, 1, 2),
                              "metric": k, "mean": float(np.mean(vals)),
                              "sd": float(np.std(vals, ddof=1)) if len(vals) > 1 else float("nan")})
     return pd.DataFrame(rows)
+
