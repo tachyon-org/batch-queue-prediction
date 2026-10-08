@@ -102,6 +102,52 @@ def _wb_start(experiment, model, split, seed, **extra):
                           seed=seed, extra=extra)
 
 
+class _ResultsLock:
+    """Exclusive lock on <json_path>.lock for the read-merge-write in
+    save_experiment_results.
+
+    flock where the filesystem supports it. Perlmutter compute nodes mount home over
+    DVS, which refuses flock (OSError errno 524); there the lock is a directory made
+    with mkdir, which is atomic on any filesystem. A directory older than STALE_S is
+    taken to be left by a killed run and removed.
+    """
+    STALE_S = 600
+
+    def __init__(self, json_path):
+        self.path = json_path + ".lock"
+        self.f = None
+        self.dir = None
+
+    def __enter__(self):
+        import fcntl
+        self.f = open(self.path, "w")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+            return self
+        except OSError:
+            self.f.close()
+            self.f = None
+        self.dir = self.path + ".d"
+        while True:
+            try:
+                os.mkdir(self.dir)
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(self.dir) > self.STALE_S:
+                        os.rmdir(self.dir)
+                        continue
+                except OSError:
+                    pass                        # released between the checks
+                time.sleep(0.5)
+
+    def __exit__(self, *exc):
+        if self.f is not None:
+            self.f.close()                      # releases the flock
+        if self.dir is not None:
+            os.rmdir(self.dir)
+
+
 def save_experiment_results(exp_name, lib, got_metrics, output_dir=None):
     """Merge one model's runs into <output_dir>/<exp_name>/<lib>.json.
 
@@ -110,15 +156,13 @@ def save_experiment_results(exp_name, lib, got_metrics, output_dir=None):
     because several seed runs of one model can finish together; an unreadable file
     raises rather than being treated as empty.
     """
-    import fcntl
     import tempfile
 
     output_dir = os.path.join(output_dir if output_dir is not None else RESULTS_DIR, exp_name)
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, f"{lib}.json")
 
-    with open(json_path + ".lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with _ResultsLock(json_path):
         data = {}
         if os.path.exists(json_path) and os.path.getsize(json_path) > 0:
             with open(json_path, "r") as f:
