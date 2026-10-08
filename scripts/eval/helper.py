@@ -34,22 +34,17 @@ MODEL_DISPLAY_NAMES = {
     "hierarchical": "Hierarchical",
 }
 
-# Attribution is not the same measurement in each family: trees report split gain,
-# TabNet reports attention mass, and the remaining neural models report the AUC drop
-# under permutation. All three are normalised to sum to 1, so a shift is in
-# percentage points either way -- but a 5-point move in gain share and a 5-point move
-# in permutation share are different phenomena, which is why they are plotted apart.
+# Attribution is not the same measurement in each family by default: trees report
+# split-based importance, TabNet attention mass, and the remaining neural models the
+# score drop under permutation. All are normalised to sum to 1, but a 5-point move in
+# gain share and in permutation share are different phenomena, which is why the
+# heatmaps keep the families in separate row blocks. load_saved_importances(...,
+# tree_importance="permutation") puts the trees on the neural models' measure.
 MODEL_FAMILIES = {
     "tree": ["xgboost", "xgb", "lightgbm", "lgb", "catboost", "cat"],
     "neural": ["mlp", "tabnet", "saint", "ft", "ft_transformer", "tsmixer", "tabr",
                "hierarchical"],
 }
-
-FAMILY_LABELS = {
-    "tree": "Gradient-boosted trees (split gain; CatBoost: PredictionValuesChange)",
-    "neural": "Neural models (permutation importance; TabNet: attention mass)",
-}
-
 
 def model_family(name):
     """'tree', 'neural', or None for a model this module does not classify."""
@@ -1254,6 +1249,8 @@ def evaluate_protocol_models(
     output_path="results/protocol_eval_results.json",
 ):
     """Evaluates models across Random and Temporal splits using thr_r statically calibrated on the Random split validation set."""
+    if tree_importance not in ("gain", "permutation"):
+        raise ValueError(f"tree_importance must be 'gain' or 'permutation', got {tree_importance!r}")
     aliases = {
         "xgboost": ["xgboost", "xgb"],
         "lightgbm": ["lightgbm", "lgb"],
@@ -1363,187 +1360,97 @@ def evaluate_protocol_models(
     return results
 
 
-def _instantiate_pytorch_model(m_name, n_feats, state_dict=None):
-    """Dynamically reconstructs PyTorch architectures by inspecting state_dict weight shapes without assuming fixed key names."""
-    m_name = m_name.lower()
-
-    if m_name == "mlp":
-        from train.mlp import MLP
-
-        if isinstance(state_dict, dict) and len(state_dict) > 0:
-            # 1. Identify embedding weights (keys with 'emb' in name)
-            emb_keys = sorted(
-                [
-                    k
-                    for k, v in state_dict.items()
-                    if isinstance(v, torch.Tensor)
-                    and v.ndim == 2
-                    and "emb" in k.lower()
-                ],
-                key=lambda k: k,
-            )
-            cards_f = [state_dict[k].shape[0] for k in emb_keys]
-            sum_emb_dim = sum(state_dict[k].shape[1] for k in emb_keys)
-
-            # 2. Identify all 2D linear weight matrices excluding embeddings
-            linear_keys = [
-                k
-                for k, v in state_dict.items()
-                if isinstance(v, torch.Tensor)
-                and v.ndim == 2
-                and k not in emb_keys
-            ]
-
-            if linear_keys:
-                # The last linear layer is the output head; preceding ones are hidden layers
-                head_key = linear_keys[-1]
-                body_keys = linear_keys[:-1]
-
-                if body_keys:
-                    first_linear_in = state_dict[body_keys[0]].shape[1]
-                    hidden = [state_dict[k].shape[0] for k in body_keys]
-                else:
-                    first_linear_in = state_dict[head_key].shape[1]
-                    hidden = []
-
-                n_num = first_linear_in - sum_emb_dim
-                out_dim = state_dict[head_key].shape[0]
-
-                net = MLP(
-                    cards_f=cards_f,
-                    n_num=n_num,
-                    out=out_dim,
-                    hidden=tuple(hidden),
-                )
-                net.load_state_dict(state_dict, strict=False)
-                return net
-
-        net = MLP(cards_f=[], n_num=n_feats)
-        if isinstance(state_dict, dict):
-            net.load_state_dict(state_dict, strict=False)
-        return net
-
-    elif m_name in ("ft", "ft_transformer"):
-        from train.ft import FTTransformer
-
-        d_token = 32
-        depth = 2
-        heads = 4
-        if isinstance(state_dict, dict):
-            if "feature_embedder.weight" in state_dict:
-                d_token = state_dict["feature_embedder.weight"].shape[-1]
-            transformer_keys = [
-                k for k in state_dict if "transformer.layers." in k
-            ]
-            if transformer_keys:
-                depth = (
-                    max(
-                        [
-                            int(k.split("transformer.layers.")[1].split(".")[0])
-                            for k in transformer_keys
-                            if k.split("transformer.layers.")[1]
-                            .split(".")[0]
-                            .isdigit()
-                        ]
-                    )
-                    + 1
-                )
-
-        net = FTTransformer(
-            num_features=n_feats, d_token=d_token, depth=depth, heads=heads
-        )
-        if isinstance(state_dict, dict):
-            net.load_state_dict(state_dict, strict=False)
-        return net
-
-    elif m_name == "saint":
-        from train.saint import SAINT
-
-        d_token = 32
-        depth = 2
-        heads = 4
-        cat_dims = []
-        n_num = n_feats
-
-        if isinstance(state_dict, dict):
-            if "num_embed" in state_dict:
-                n_num = state_dict["num_embed"].shape[0]
-                d_token = state_dict["num_embed"].shape[1]
-
-            layer_indices = [
-                int(k.split(".")[1])
-                for k in state_dict.keys()
-                if k.startswith("layers.") and k.split(".")[1].isdigit()
-            ]
-            if layer_indices:
-                depth = max(layer_indices) + 1
-
-        net = SAINT(
-            n_num=n_num,
-            cat_dims=cat_dims,
-            d_token=d_token,
-            depth=depth,
-            heads=heads,
-        )
-        if isinstance(state_dict, dict):
-            net.load_state_dict(state_dict, strict=False)
-        return net
-
-    return None
-
 def compute_permutation_importance(
-    model, X_eval, y_eval, device="cuda", batch_size=32768, sample_size=None, kind="bin"
+    model, X_eval, y_eval, device="cuda", batch_size=32768, sample_size=None, kind="bin",
+    predict_fn=None, seed=0,
 ):
-    """Computes Permutation Feature Importance for PyTorch DL models: the drop in ROC-AUC
-    for a classifier (kind="bin"), or in R^2 on the model's own target scale -- log1p
-    wait for E2 -- for a regressor (kind="reg", raw outputs, no sigmoid).
+    """Permutation feature importance: the drop in ROC-AUC for a classifier
+    (kind="bin"), or in R^2 on the model's own target scale -- log1p wait for E2 --
+    for a regressor (kind="reg").
 
-    Uses 100% of X_eval if sample_size is None or if len(X_eval) <= sample_size.
+    `model` is a PyTorch module (sigmoid applied for kind="bin"). Pass `predict_fn`
+    instead -- a function from a float32 matrix to probabilities (bin) or raw
+    predictions (reg) -- for any other model, e.g. the trees (see _tree_predict_fn).
+
+    The shuffles come from `seed`, so every model scored on the same X_eval sees the
+    same permutation of each feature. Uses all of X_eval unless sample_size is smaller.
+    Negative drops are clipped to 0 and the result is normalised to sum to 1.
     """
-    if hasattr(model, "eval"):
-        model.eval()
+    rng = np.random.default_rng(seed)
+    if predict_fn is None:
+        if hasattr(model, "eval"):
+            model.eval()
+
+        def predict_fn(X_data):
+            preds = []
+            for i in range(0, len(X_data), batch_size):
+                bx = torch.from_numpy(X_data[i : i + batch_size]).float().to(device)
+                with torch.no_grad():
+                    out = model(bx)
+                    if hasattr(out, "logits"):
+                        out = out.logits
+                    if out.ndim > 1:
+                        out = out.squeeze(-1)
+                    out = out.float() if kind == "reg" else torch.sigmoid(out.float())
+                    preds.append(out.cpu().numpy())
+            return np.concatenate(preds)
 
     if sample_size is not None and len(X_eval) > sample_size:
-        idx = np.random.choice(len(X_eval), size=sample_size, replace=False)
+        idx = rng.choice(len(X_eval), size=sample_size, replace=False)
         X_sub, y_sub = X_eval[idx], y_eval[idx]
     else:
         X_sub, y_sub = X_eval.copy(), y_eval.copy()
-
-    def _predict(X_data):
-        preds = []
-        for i in range(0, len(X_data), batch_size):
-            bx = torch.from_numpy(X_data[i : i + batch_size]).float().to(device)
-            with torch.no_grad():
-                out = model(bx)
-                if hasattr(out, "logits"):
-                    out = out.logits
-                if out.ndim > 1:
-                    out = out.squeeze(-1)
-                out = out.float() if kind == "reg" else torch.sigmoid(out.float())
-                preds.append(out.cpu().numpy())
-        return np.concatenate(preds)
+    X_sub = np.ascontiguousarray(X_sub, dtype=np.float32)
 
     _score = r2_score if kind == "reg" else roc_auc_score
-    base_preds = _predict(X_sub)
-    base_auc = _score(y_sub, base_preds)
+    base = _score(y_sub, predict_fn(X_sub))
 
     n_features = X_sub.shape[1]
     importance_scores = np.zeros(n_features)
-
     for f_idx in range(n_features):
         X_perm = X_sub.copy()
-        np.random.shuffle(X_perm[:, f_idx])
-
-        perm_preds = _predict(X_perm)
-        perm_auc = _score(y_sub, perm_preds)
-
-        importance_scores[f_idx] = max(0.0, base_auc - perm_auc)
+        X_perm[:, f_idx] = X_perm[rng.permutation(len(X_perm)), f_idx]
+        importance_scores[f_idx] = max(0.0, base - _score(y_sub, predict_fn(X_perm)))
 
     total_imp = importance_scores.sum()
     if total_imp > 0:
         importance_scores = importance_scores / total_imp
 
     return importance_scores
+
+
+def _tree_predict_fn(model_name, file_path, kind="bin"):
+    """A predict function for a saved tree model, for compute_permutation_importance:
+    probabilities for kind="bin", raw predictions (log1p wait for E2) for kind="reg".
+    Categorical columns are handled as at training: XGBoost reads the feature types
+    stored in the model, LightGBM its stored categorical features, and CatBoost gets
+    the integer-coded frame it was fitted on."""
+    m_name = model_name.lower()
+    if m_name in ("xgboost", "xgb"):
+        import xgboost as xgb
+        bst = xgb.Booster()
+        bst.load_model(file_path)
+        bst.set_param({"device": "cpu"})
+        ft = bst.feature_types
+        cat = bool(ft) and "c" in ft
+        return lambda X: bst.predict(xgb.DMatrix(X, feature_types=ft, enable_categorical=cat))
+    if m_name in ("lightgbm", "lgb"):
+        import lightgbm as lgb
+        bst = lgb.Booster(model_file=file_path)
+        return lambda X: bst.predict(X)
+    if m_name in ("catboost", "cat"):
+        from catboost import CatBoostClassifier, CatBoostRegressor
+        from train.tree import _cb_frame
+        cb = CatBoostRegressor() if kind == "reg" else CatBoostClassifier()
+        cb.load_model(file_path)
+        cat_idx = list(cb.get_cat_feature_indices())
+
+        def _predict(X):
+            frame = _cb_frame(X, len(cat_idx), cat_idx) if cat_idx else None
+            data = frame if frame is not None else X
+            return cb.predict(data) if kind == "reg" else cb.predict_proba(data)[:, 1]
+        return _predict
+    raise ValueError(f"Unsupported tree model identifier: {model_name}")
 
 
 def extract_tree_importance(model_name, file_path, n_feats, kind="bin"):
@@ -1675,6 +1582,21 @@ def _instantiate_pytorch_model(m_name, n_feats, state_dict=None):
             print(f"[Error Instantiating SAINT] {e}")
             return None
 
+    elif m_name == "tsmixer":
+        # Takes the raw (rows, features) matrix like FT-Transformer; width and depth
+        # are read off the saved weights.
+        from train.tsmixer import TSMixer
+
+        d_model, depth = 32, 3
+        if isinstance(state_dict, dict):
+            if "feature_proj.weight" in state_dict:
+                d_model = state_dict["feature_proj.weight"].shape[0]
+            blocks = {int(k.split(".")[1]) for k in state_dict
+                      if k.startswith("blocks.") and k.split(".")[1].isdigit()}
+            if blocks:
+                depth = max(blocks) + 1
+        return TSMixer(num_features=n_feats, d_model=d_model, depth=depth)
+
     return None
 
 def load_saved_importances(
@@ -1697,8 +1619,14 @@ def load_saved_importances(
     exp_tag="bin_e1",
     device=None,
     kind="bin",
+    tree_importance="gain",
 ):
     """Scans directories, loads saved Tree, TabNet, and PyTorch DL models, and returns.
+
+    `tree_importance` is "gain" (each library's own split-based importance, read from
+    the saved model) or "permutation" (the same permutation importance as the neural
+    models, on the same X_eval / y_eval with the same shuffles). The choice is recorded
+    in imp_dict["__method__"] so the heatmap notes describe it.
 
     `kind="reg"` is for the E2 wait-time regressors: trees load as regressors, TabNet as
     a TabNetRegressor, and permutation importance is the drop in R^2 on `y_eval`, which
@@ -1714,6 +1642,8 @@ def load_saved_importances(
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    if tree_importance not in ("gain", "permutation"):
+        raise ValueError(f"tree_importance must be 'gain' or 'permutation', got {tree_importance!r}")
     aliases = {
         "xgboost": ["xgboost", "xgb"],
         "lightgbm": ["lightgbm", "lgb"],
@@ -1725,7 +1655,7 @@ def load_saved_importances(
         "tabr": ["tabr"],
         "tsmixer": ["tsmixer"],
     }
-    imp_dict = {}
+    imp_dict = {"__method__": {"tree": tree_importance}}
 
     for m in models:
         m_lower = m.lower()
@@ -1756,12 +1686,21 @@ def load_saved_importances(
             # 1. Decision Trees
             if m_lower in ("xgboost", "xgb", "lightgbm", "lgb", "catboost", "cat"):
                 try:
-                    imp_dict[(m, split)] = extract_tree_importance(
-                        m_lower, matched_path, n_feats, kind=kind
-                    )
-                    print(f"[Loaded Tree Model] {m:10s} ({split:8s}) <- {matched_path}")
+                    if tree_importance == "permutation":
+                        if X_eval is None or y_eval is None:
+                            print(f"[Skipping Permutation Imp] {m:10s} ({split:8s}): Pass X_eval and y_eval.")
+                            continue
+                        imp_dict[(m, split)] = compute_permutation_importance(
+                            None, X_eval, y_eval, kind=kind,
+                            predict_fn=_tree_predict_fn(m_lower, matched_path, kind=kind))
+                        print(f"[Computed Permutation Imp] {m:10s} ({split:8s}) <- {matched_path}")
+                    else:
+                        imp_dict[(m, split)] = extract_tree_importance(
+                            m_lower, matched_path, n_feats, kind=kind
+                        )
+                        print(f"[Loaded Tree Model] {m:10s} ({split:8s}) <- {matched_path}")
                 except Exception as e:
-                    print(f"[Error] Failed loading tree model {m}/{split} from {matched_path}: {e}")
+                    print(f"[Error] Failed tree importance for {m}/{split} from {matched_path}: {e}")
 
             elif m_lower == "tabnet":
                 try:
@@ -2066,6 +2005,7 @@ def feature_split_imp_heatmap(
     split_key: str = "temporal",
     models: list[str] = None,
     title: str = None,
+    exp: str = None,
     cmap=None,
     min_importance_threshold: float = 0.1,
     output_prefix: str = "feature_split_imp_heatmap",
@@ -2203,9 +2143,9 @@ def feature_split_imp_heatmap(
         df_cat, df_non_cat, _disp, cmap=cmap, vmin=0.0, vmax=1.0, center=None,
         cbar_ticks=[0.0, 0.5, 1.0], cbar_ticklabels=["0", "0.5", "1"],
         cbar_label="Importance within row, $I / I_{\\max}$", title=_title,
-        note=("Each row is scaled by its own largest importance: colour compares "
-              "features within a row, not magnitudes between rows.\n" + _ATTRIBUTION_NOTE),
-        output_prefix=f"{output_prefix}_{split_key}")
+        note="Each row is divided by its largest importance.\n" + _attribution_note(imp_dict),
+        row_labels=_row_labels(imp_dict),
+        output_prefix=(f"{exp}_" if exp else "") + f"{output_prefix}_{split_key}")
     return df_cat, df_non_cat
 
 
@@ -2235,16 +2175,34 @@ def _shift_cmap():
         "shift", [COLORS["secondary"], "#FFFFFF", COLORS["primary"]])
 
 
-_FAMILY_ROW_LABELS = {"tree": "Trees\n(gain)", "neural": "Neural\n(permutation)"}
-_ATTRIBUTION_NOTE = (
-    "Trees are attributed by split gain (CatBoost: PredictionValuesChange); neural "
-    "models by permutation importance (drop in ROC-AUC), TabNet by attention-mask "
-    "mass. These are different quantities, so the two blocks are not on a common scale.")
+def _tree_method(imp_dict):
+    """How the tree rows were computed: "gain" or "permutation" (load_saved_importances)."""
+    return (imp_dict.get("__method__") or {}).get("tree", "gain")
+
+
+def _row_labels(imp_dict):
+    tree = "Trees\n(permutation)" if _tree_method(imp_dict) == "permutation" else "Trees\n(gain)"
+    return {"tree": tree, "neural": "Neural\n(permutation)"}
+
+
+def _attribution_note(imp_dict):
+    """How each family's importances are computed -- method only, nothing about results."""
+    perm = ("permutation importance (the score drop when one feature's values are "
+            "shuffled) on a held-out sample of out-of-time jobs")
+    if _tree_method(imp_dict) == "permutation":
+        body = (f"All models except TabNet: {perm}, with the same shuffles for every model. "
+                "TabNet: attention-mask mass on the same jobs.")
+    else:
+        body = ("Tree models: split-based importance read from the trained model "
+                "(XGBoost: average gain; LightGBM: total gain; CatBoost: "
+                f"PredictionValuesChange). Neural models: {perm}; TabNet: attention-mask "
+                "mass on the same jobs.")
+    return body + " Each model's importances are normalised to sum to 1."
 
 
 def _family_block_heatmap(df_cat, df_non_cat, row_family, *, cmap, vmin, vmax, center,
                           cbar_ticks, cbar_ticklabels, cbar_label, title, note,
-                          output_prefix):
+                          output_prefix, row_labels):
     """One table with rows grouped by model family (trees / neural) and columns by
     categorical / continuous, a gap between the groups in both directions, and one
     shared colorbar. `row_family` maps each row label to "tree", "neural" or None.
@@ -2294,7 +2252,7 @@ def _family_block_heatmap(df_cat, df_non_cat, row_family, *, cmap, vmin, vmax, c
                     ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
                 if ci == 0:
                     ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-                    ax.set_ylabel(_FAMILY_ROW_LABELS.get(fam, "Other"),
+                    ax.set_ylabel(row_labels.get(fam, "Other"),
                                   fontweight="bold", labelpad=10)
             axes[ri, -1].axis("off")
 
@@ -2312,25 +2270,10 @@ def _family_block_heatmap(df_cat, df_non_cat, row_family, *, cmap, vmin, vmax, c
         figures_dir = os.path.join(os.getcwd(), "output")
         os.makedirs(figures_dir, exist_ok=True)
         plt.savefig(os.path.join(figures_dir, f"{output_prefix}.pdf"), bbox_inches="tight")
-        plt.savefig(os.path.join(figures_dir, f"{output_prefix}.png"),
-                    bbox_inches="tight", dpi=300)
+        #plt.savefig(os.path.join(figures_dir, f"{output_prefix}.png"),
+                    # bbox_inches="tight", dpi=300)
         plt.show()
     return df_all
-
-
-def imp_diff_heatmaps_by_family(imp_dict, feats, **kw):
-    """Render the gain-shift heatmap once per model family.
-
-    Returns {family: DataFrame}. Families with no models present are skipped.
-    """
-    out = {}
-    base_title = kw.pop("title", "Feature Gain Shift: Random vs. Temporal Split Protocol")
-    for fam in ("tree", "neural"):
-        df = imp_diff_heatmap(imp_dict=imp_dict, feats=feats, family=fam,
-                              title=base_title, **kw)
-        if df is not None:
-            out[fam] = df
-    return out
 
 
 def imp_diff_heatmap(
@@ -2342,31 +2285,18 @@ def imp_diff_heatmap(
     cardinality_threshold: int = 50,
     models: list[str] = None,
     title: str = "Feature Gain Shift: Random vs. Temporal Split Protocol",
-    min_importance_threshold: float = None,
-    output_prefix: str = "imp_diff_heatmap_side_by_side",
-    per_model_scale: bool = True,
-    family: str = None,
+    min_importance_threshold: float = 0.1,
+    output_prefix: str = "imp_diff_heatmap",
+    exp: str = None,
 ):
-    """Renders heatmaps comparing (Temporal - Random) feature importance shifts.
+    """Renders the (Temporal - Random) feature importance shift as one table: rows
+    grouped by model family (trees / neural), columns split into categorical and
+    continuous features, matching feature_split_imp_heatmap column for column.
 
-    `per_model_scale=True` (the default) gives every model its own row, its own
-    colour scale and its own colorbar, with values in percentage points of that
-    model's total importance. This is the form to use in the paper. The alternative
-    -- one shared colorbar over rows that have each been divided by their own maximum
-    -- invites a cross-model colour comparison that the scaling makes meaningless,
-    which is what made the earlier version hard to read.
-
-    `family` selects "tree" or "neural" (see MODEL_FAMILIES). The two measure
-    importance differently and are not on a common footing, so they are plotted
-    separately; `imp_diff_heatmaps_by_family` renders both in one call.
-
-    With `per_model_scale=False` the columns are additionally split side-by-side into
-    Categorical vs. Numerical/Dynamic features.
+    Each cell is the temporal cell minus the random cell of the two per-split
+    heatmaps (each split's row scaled by its own largest importance), on a fixed
+    +/-1 scale. `exp` ("e1", "e2", "e3") prefixes the saved file name.
     """
-    # Percentage points when per-model, fraction-of-max when normalised.
-    if min_importance_threshold is None:
-        min_importance_threshold = 0.2 if per_model_scale else 0.1
-
     # Helper function to convert arrays/dicts to aligned pandas Series
     def _clean_and_normalize(val):
         if isinstance(val, np.ndarray):
@@ -2402,32 +2332,26 @@ def imp_diff_heatmap(
         ):
             ordered_models.append(m)
 
-    if family is not None:
-        if family not in MODEL_FAMILIES:
-            raise ValueError(f"family must be one of {sorted(MODEL_FAMILIES)}, got {family!r}")
-        members = set(MODEL_FAMILIES[family])
-        ordered_models = [m for m in ordered_models if m.lower() in members]
+    def _by_max(s):
+        """Divided by the row's largest |importance| -- the scaling the per-split
+        heatmaps (feature_split_imp_heatmap) display."""
+        mx = np.nanmax(np.abs(s.values))
+        return s / mx if mx > 0 else s
 
-    rows = {}
+    rows, score = {}, {}
     for m in ordered_models:
         imp_rand = _clean_and_normalize(imp_dict[(m, "random")])
         imp_temp = _clean_and_normalize(imp_dict[(m, "temporal")])
-
-        # Feature gain shift (Temporal - Random)
-        delta = imp_temp - imp_rand
-
-        if per_model_scale:
-            # Percentage points of that model's total importance. Readable as-is and
-            # comparable within a row; no cross-row rescaling to misinterpret.
-            delta = delta * 100.0
-        else:
-            # Row-wise Max-Abs scaling: maps each model's maximum shift to [-1, +1]
-            max_abs = np.nanmax(np.abs(delta.values))
-            if max_abs > 0:
-                delta = delta / max_abs
-
         disp_name = display_names.get(m.lower(), m)
-        rows[disp_name] = delta
+
+        # The difference of the two per-split heatmaps, cell for cell: each split
+        # scaled by its own largest importance, then subtracted, with no further
+        # rescaling. Dividing the difference by its own row maximum (the earlier
+        # form) stretched a sub-1-point shift to +/-1 whenever a row's shifts were
+        # all small, and squeezed every other cell when one shift was large.
+        r, t = _by_max(imp_rand), _by_max(imp_temp)
+        rows[disp_name] = t - r
+        score[disp_name] = np.maximum(r.abs(), t.abs())
 
     if not rows:
         print(
@@ -2486,94 +2410,40 @@ def imp_diff_heatmap(
     )
 
     # --- Step 2: Apply Threshold & Sorting ---
-    if min_importance_threshold > 0:
-        if not df_cat.empty:
-            df_cat = df_cat.loc[
-                :, df_cat.abs().max(axis=0) >= min_importance_threshold
-            ]
-        if not df_non_cat.empty:
-            df_non_cat = df_non_cat.loc[
-                :, df_non_cat.abs().max(axis=0) >= min_importance_threshold
-            ]
+    # Same columns, in the same order, as the per-split heatmaps: features whose
+    # importance reaches the threshold under either split, most important first.
+    # Selecting on |delta| instead would drop exactly the stable features those
+    # heatmaps show, and the figures could no longer be read column by column.
+    col_score = pd.DataFrame(score).T.max(axis=0).reindex(feats).fillna(0.0)
 
-    if not df_cat.empty:
-        sort_cat = df_cat.abs().max(axis=0).sort_values(ascending=False).index
-        df_cat = df_cat[sort_cat]
+    def _select(frame):
+        if frame.empty:
+            return frame
+        keep = [c for c in frame.columns if col_score[c] >= min_importance_threshold]
+        return frame[sorted(keep, key=lambda c: -col_score[c])]
 
-    if not df_non_cat.empty:
-        sort_non_cat = (
-            df_non_cat.abs().max(axis=0).sort_values(ascending=False).index
-        )
-        df_non_cat = df_non_cat[sort_non_cat]
+    df_cat, df_non_cat = _select(df_cat), _select(df_non_cat)
 
     if df_cat.empty and df_non_cat.empty:
         print(
-            f"[skip] {title}: all features fell below shift threshold ({min_importance_threshold})"
+            f"[skip] {title}: all features fell below importance threshold ({min_importance_threshold})"
         )
         return
 
-    # --- Step 3: Render Heatmap(s) ---
-    sns.plotting_context("talk")
-
-    if per_model_scale:
-        with plt.rc_context(_shift_rc()):
-            # One row per model, each with its own symmetric scale and its own colorbar.
-            df_p = pd.concat([df_cat, df_non_cat], axis=1)
-            df_p = df_p[df_p.abs().max(axis=0).sort_values(ascending=False).index]
-            n_models = len(df_p.index)
-
-            # constrained layout, not tight_layout: seaborn attaches a colorbar axes to
-            # every row, and tight_layout cannot place those (it warns and may shift the
-            # annotations out of their cells).
-            fig, axes = plt.subplots(
-                n_models, 1,
-                figsize=(4 + 0.9 * len(df_p.columns), 1.5 * n_models + 1.2),
-                sharex=True, squeeze=False, layout="constrained",
-            )
-            for i, model_name in enumerate(df_p.index):
-                ax = axes[i, 0]
-                row_df = df_p.loc[[model_name]]
-                lim = float(np.nanmax(np.abs(row_df.values))) or 1.0
-                is_last = i == n_models - 1
-                sns.heatmap(
-                    row_df, cmap=_shift_cmap(), center=0, vmin=-lim, vmax=lim,
-                    annot=True, fmt=".2f", annot_kws={"size": _SHIFT_FONT - 3},
-                    cbar_kws={"label": "\u0394 (pp)", "shrink": 0.85, "pad": 0.01},
-                    linewidths=0.5, linecolor="white",
-                    xticklabels=df_p.columns if is_last else False, ax=ax,
-                )
-                ax.tick_params(length=0)
-                ax.set_ylabel("")
-                ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-                if is_last:
-                    ax.set_xticklabels(ax.get_xticklabels(), rotation=45,
-                                       ha="right")
-
-            sub = FAMILY_LABELS.get(family)
-            fig.suptitle(f"{title}\n{sub}" if sub else title,
-                         fontweight="bold", fontsize=_SHIFT_FONT + 3)
-
-            figures_dir = os.path.join(os.getcwd(), "output")
-            os.makedirs(figures_dir, exist_ok=True)
-            stem = f"{output_prefix}_{family}" if family else output_prefix
-            plt.savefig(os.path.join(figures_dir, f"{stem}.pdf"), bbox_inches="tight")
-            plt.savefig(os.path.join(figures_dir, f"{stem}.png"),
-                        bbox_inches="tight", dpi=300)
-            plt.show()
-        return df_p
-
-    # Normalised form. Each row is divided by its own max |delta|, which fixes the
-    # within-row scale but does not make split gain and permutation importance
-    # commensurate -- hence the family blocks and the note under the figure.
+    # --- Step 3: Render ---
+    # Normalised form: the per-split heatmaps' cells, temporal minus random, on a fixed
+    # +/-1 scale. The family blocks remain because split gain and permutation
+    # importance are still not commensurate (see the note under the figure).
     _disp = {display_names.get(m.lower(), m): model_family(m) for m in ordered_models}
     return _family_block_heatmap(
         df_cat, df_non_cat, _disp, cmap=_shift_cmap(), vmin=-1.0, vmax=1.0, center=0,
         cbar_ticks=[-1.0, 0.0, 1.0], cbar_ticklabels=["\u22121\nrandom", "0", "+1\ntemporal"],
-        cbar_label="Shift within row, \u0394 / max |\u0394|", title=title,
-        note=("\u0394 = temporal \u2212 random share of each model's total importance, "
-              "scaled by that row's largest |\u0394|: colour compares features within a "
-              "row, not magnitudes between rows.\n" + _ATTRIBUTION_NOTE),
-        output_prefix=output_prefix)
+        cbar_label="\u0394 importance within row, $I / I_{\\max}$", title=title,
+        note=("\u0394 = temporal \u2212 random, cell for cell, of the two per-split "
+              "heatmaps, each row divided by its largest importance.\n"
+              + _attribution_note(imp_dict)),
+        row_labels=_row_labels(imp_dict),
+        output_prefix=f"{exp}_{output_prefix}" if exp else output_prefix)
 
 
 # ---- Feature-matrix standardisation ----------------------------------------
